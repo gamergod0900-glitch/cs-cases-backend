@@ -49,7 +49,38 @@ async function initDatabase() {
     );
   `);
 
-  console.log("База данных готова: таблицы users, inventory, openings проверены/созданы");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS withdrawals (
+      id SERIAL PRIMARY KEY,
+      telegram_id BIGINT NOT NULL REFERENCES users(telegram_id),
+      item_name TEXT NOT NULL,
+      item_value INTEGER NOT NULL,
+      trade_link TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      requested_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  console.log("База данных готова: таблицы users, inventory, openings, withdrawals проверены/созданы");
+}
+
+// Отправка сообщения владельцу проекта в Telegram через Bot API
+async function notifyAdmin(text) {
+  const token = process.env.BOT_TOKEN;
+  const adminId = process.env.ADMIN_TELEGRAM_ID;
+  if (!token || !adminId) {
+    console.warn("BOT_TOKEN или ADMIN_TELEGRAM_ID не заданы — уведомление не отправлено");
+    return;
+  }
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: adminId, text, parse_mode: "HTML" })
+    });
+  } catch (err) {
+    console.error("Не удалось отправить уведомление в Telegram:", err);
+  }
 }
 
 // ===== Описание кейсов и их содержимого (хранится прямо в коде сервера) =====
@@ -195,6 +226,78 @@ app.get("/api/history/:telegram_id", async (req, res) => {
       [req.params.telegram_id]
     );
     res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Продать предмет из инвентаря обратно на баланс
+app.post("/api/inventory/sell", async (req, res) => {
+  try {
+    const { telegram_id, item_id } = req.body;
+
+    const itemResult = await pool.query(
+      "SELECT * FROM inventory WHERE id = $1 AND telegram_id = $2",
+      [item_id, telegram_id]
+    );
+    if (itemResult.rows.length === 0) {
+      return res.status(404).json({ error: "Предмет не найден" });
+    }
+    const item = itemResult.rows[0];
+
+    await pool.query("DELETE FROM inventory WHERE id = $1", [item_id]);
+
+    const updated = await pool.query(
+      "UPDATE users SET balance = balance + $1 WHERE telegram_id = $2 RETURNING balance",
+      [item.value, telegram_id]
+    );
+
+    res.json({ newBalance: updated.rows[0].balance });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Запросить вывод предмета (ручная обработка через Telegram-уведомление владельцу)
+app.post("/api/inventory/withdraw", async (req, res) => {
+  try {
+    const { telegram_id, item_id, trade_link } = req.body;
+    if (!trade_link || !trade_link.trim()) {
+      return res.status(400).json({ error: "Укажи ссылку на трейд" });
+    }
+
+    const itemResult = await pool.query(
+      "SELECT * FROM inventory WHERE id = $1 AND telegram_id = $2",
+      [item_id, telegram_id]
+    );
+    if (itemResult.rows.length === 0) {
+      return res.status(404).json({ error: "Предмет не найден" });
+    }
+    const item = itemResult.rows[0];
+
+    const userResult = await pool.query("SELECT * FROM users WHERE telegram_id = $1", [telegram_id]);
+    const user = userResult.rows[0];
+
+    await pool.query("DELETE FROM inventory WHERE id = $1", [item_id]);
+
+    await pool.query(
+      `INSERT INTO withdrawals (telegram_id, item_name, item_value, trade_link)
+       VALUES ($1, $2, $3, $4)`,
+      [telegram_id, item.item_name, item.value, trade_link.trim()]
+    );
+
+    const userLabel = user.username ? `@${user.username}` : (user.first_name || `ID ${telegram_id}`);
+    await notifyAdmin(
+      `🎁 <b>Запрос на вывод предмета</b>\n\n` +
+      `Игрок: ${userLabel} (id ${telegram_id})\n` +
+      `Предмет: ${item.item_name}\n` +
+      `Ценность: ${item.value} ₴\n` +
+      `Ссылка на трейд: ${trade_link.trim()}`
+    );
+
+    res.json({ success: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Ошибка сервера" });
