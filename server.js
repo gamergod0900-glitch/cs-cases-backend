@@ -156,32 +156,38 @@ async function answerCallback(callbackQueryId, text) {
 
 // ===== Описание кейсов и их содержимого (хранится прямо в коде сервера) =====
 const CASES = {
-  gold: {
-    name: "Штурмовой Арсенал",
-    price: 50,
+  anomaly: {
+    name: "Аномалия",
+    price: 90,
     items: [
-      { name: "АК-47 | Снежный камуфляж", image: "images/skin-ak-white.png", rarity: "common", weight: 60, value: 40 },
-      { name: "АК-47 | Ледяная синь", image: "images/skin-ak-blue.png", rarity: "rare", weight: 30, value: 90 },
-      { name: "АК-47 | Лесной хаос", image: "images/skin-ak-camo.png", rarity: "epic", weight: 10, value: 220 }
+      { name: "Desert Eagle | Firebreathing", image: "images/skin-deagle-fire.png", rarity: "common", weight: 35, value: 45 },
+      { name: "PP-Bizon | Чертёж объекта", image: "images/skin-bizon-blueprint.png", rarity: "common", weight: 30, value: 55 },
+      { name: "ПП-19 Бизон | Предатель", image: "images/skin-bizon-traitor.png", rarity: "rare", weight: 18, value: 130 },
+      { name: "R8 Revolver | Cobalt Grip", image: "images/skin-r8-cobalt.png", rarity: "rare", weight: 10, value: 160 },
+      { name: "AWP | Chromatic Aberration", image: "images/skin-awp-chromatic.png", rarity: "epic", weight: 5, value: 480 },
+      { name: "Керамбит | Ультрафиолет", image: "images/skin-karambit-uv.png", rarity: "legendary", weight: 2, value: 1350 }
     ]
   },
-  platinum: {
-    name: "Клинок Императора",
-    price: 200,
+  "blood-mark": {
+    name: "Кровавая Метка",
+    price: 60,
     items: [
-      { name: "Керамбит-крюк | Танзанит", image: "images/skin-knife-hook.png", rarity: "rare", weight: 50, value: 350 },
-      { name: "Штык-нож | Морская глубина", image: "images/skin-knife-blue.png", rarity: "epic", weight: 35, value: 700 },
-      { name: "Клинок | Северное сияние", image: "images/skin-knife-gradient.png", rarity: "legendary", weight: 15, value: 1500 }
+      { name: "Glock-18 | Карамельное яблоко", image: "images/skin-glock-candy.png", rarity: "common", weight: 35, value: 30 },
+      { name: "MAG-7 | Разрушение ядра", image: "images/skin-mag7-core.png", rarity: "common", weight: 27, value: 45 },
+      { name: "CZ75-Auto | Настоящий змееяд", image: "images/skin-cz75-viper.png", rarity: "rare", weight: 20, value: 110 },
+      { name: "G3SG1 | Red Jasper", image: "images/skin-g3sg1-jasper.png", rarity: "epic", weight: 13, value: 320 },
+      { name: "AWP | Градиент", image: "images/skin-awp-gradient.png", rarity: "legendary", weight: 5, value: 900 }
     ]
   },
-  silver: {
-    name: "Тайный Агент",
-    price: 30,
+  "blue-pulse": {
+    name: "Синий Импульс",
+    price: 100,
     items: [
-      { name: "Beretta | Лесная тень", image: "images/skin-beretta.png", rarity: "common", weight: 50, value: 20 },
-      { name: "Glock | Радужный отблеск", image: "images/skin-glock.png", rarity: "common", weight: 30, value: 35 },
-      { name: "USP-S | Алый шёпот", image: "images/skin-usp-red.png", rarity: "rare", weight: 15, value: 80 },
-      { name: "USP-S | Золотой монстр", image: "images/skin-usp-gold.png", rarity: "legendary", weight: 5, value: 300 }
+      { name: "CZ75-Auto | Полуночная пальма", image: "images/skin-cz75-palm.png", rarity: "common", weight: 32, value: 35 },
+      { name: "MAG-7 | Чайка", image: "images/skin-mag7-gull.png", rarity: "common", weight: 28, value: 50 },
+      { name: "Negev | Сверхлёгкий", image: "images/skin-negev-light.png", rarity: "rare", weight: 20, value: 140 },
+      { name: "AK-47 | Вулкан", image: "images/skin-ak-vulcan.png", rarity: "epic", weight: 15, value: 520 },
+      { name: "Скелетный нож | Патина", image: "images/skin-skeleton-knife.png", rarity: "legendary", weight: 5, value: 1400 }
     ]
   }
 };
