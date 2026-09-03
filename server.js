@@ -172,6 +172,23 @@ async function answerCallback(callbackQueryId, text) {
 // Курс фиксированный и его нужно периодически обновлять вручную под актуальный курс.
 const UAH_PER_USD = 41;
 
+// Список криптовалют, которые предлагаем для пополнения (код NOWPayments + читаемое название)
+const SUPPORTED_CURRENCIES = [
+  { code: "usdttrc20", label: "USDT (TRC20)" },
+  { code: "usdterc20", label: "USDT (ERC20)" },
+  { code: "ton", label: "Toncoin (TON)" },
+  { code: "btc", label: "Bitcoin (BTC)" },
+  { code: "eth", label: "Ethereum (ETH)" },
+  { code: "ltc", label: "Litecoin (LTC)" },
+  { code: "trx", label: "TRON (TRX)" },
+  { code: "doge", label: "Dogecoin (DOGE)" }
+];
+
+// Кэш минимальных сумм — чтобы не дёргать NOWPayments при каждом открытии экрана пополнения
+let currencyMinCache = null;
+let currencyMinCacheTime = 0;
+const CURRENCY_CACHE_TTL = 60 * 60 * 1000; // 1 час
+
 const CASES = {
   anomaly: {
     name: "Аномалия",
@@ -482,12 +499,49 @@ app.post("/api/topup", async (req, res) => {
   }
 });
 
+// Список доступных криптовалют с минимальной суммой пополнения в гривне для каждой
+app.get("/api/payment/currencies", async (req, res) => {
+  try {
+    const now = Date.now();
+    if (currencyMinCache && now - currencyMinCacheTime < CURRENCY_CACHE_TTL) {
+      return res.json(currencyMinCache);
+    }
+
+    const results = [];
+    for (const currency of SUPPORTED_CURRENCIES) {
+      try {
+        const npRes = await fetch(
+          `https://api.nowpayments.io/v1/min-amount?currency_from=usd&currency_to=${currency.code}`,
+          { headers: { "x-api-key": process.env.NOWPAYMENTS_API_KEY } }
+        );
+        const npData = await npRes.json();
+        if (npData.min_amount) {
+          const minUah = Math.ceil((npData.min_amount * UAH_PER_USD) / 5) * 5; // округляем до 5 ₴ для красоты
+          results.push({ code: currency.code, label: currency.label, min_uah: minUah });
+        }
+      } catch (innerErr) {
+        console.warn(`Не удалось получить минимальную сумму для ${currency.code}:`, innerErr.message);
+      }
+    }
+
+    currencyMinCache = results;
+    currencyMinCacheTime = now;
+    res.json(results);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
 // Создать настоящий криптоплатёж через NOWPayments
 app.post("/api/payment/create", async (req, res) => {
   try {
-    const { telegram_id, amount_uah } = req.body;
+    const { telegram_id, amount_uah, pay_currency } = req.body;
     if (!amount_uah || amount_uah <= 0) {
       return res.status(400).json({ error: "Некорректная сумма" });
+    }
+    if (!pay_currency) {
+      return res.status(400).json({ error: "Выбери криптовалюту для оплаты" });
     }
 
     const amount_usd = +(amount_uah / UAH_PER_USD).toFixed(2);
@@ -502,6 +556,7 @@ app.post("/api/payment/create", async (req, res) => {
       body: JSON.stringify({
         price_amount: amount_usd,
         price_currency: "usd",
+        pay_currency,
         order_id,
         order_description: "Пополнение баланса CS Cases",
         ipn_callback_url: "https://cs-cases-backend.onrender.com/nowpayments-webhook"
@@ -511,7 +566,7 @@ app.post("/api/payment/create", async (req, res) => {
     const npData = await npRes.json();
     if (!npData.invoice_url) {
       console.error("Ошибка создания счёта NOWPayments:", npData);
-      return res.status(500).json({ error: "Не удалось создать платёж, попробуй позже" });
+      return res.status(500).json({ error: npData.message || "Не удалось создать платёж, попробуй позже" });
     }
 
     await pool.query(
