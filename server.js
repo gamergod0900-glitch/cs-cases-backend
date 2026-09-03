@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
 const app = express();
 app.use(cors());
@@ -65,7 +66,19 @@ async function initDatabase() {
   // На случай, если таблица withdrawals уже была создана раньше без этой колонки
   await pool.query(`ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS inventory_id INTEGER;`);
 
-  console.log("База данных готова: таблицы users, inventory, openings, withdrawals проверены/созданы");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id SERIAL PRIMARY KEY,
+      telegram_id BIGINT NOT NULL REFERENCES users(telegram_id),
+      order_id TEXT UNIQUE NOT NULL,
+      amount_uah INTEGER NOT NULL,
+      amount_usd NUMERIC NOT NULL,
+      status TEXT NOT NULL DEFAULT 'waiting',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  console.log("База данных готова: таблицы users, inventory, openings, withdrawals, payments проверены/созданы");
 }
 
 // Отправка сообщения владельцу проекта в Telegram через Bot API
@@ -155,6 +168,10 @@ async function answerCallback(callbackQueryId, text) {
 }
 
 // ===== Описание кейсов и их содержимого (хранится прямо в коде сервера) =====
+// Курс для конвертации гривны в доллары при создании счёта на оплату (NOWPayments принимает суммы в USD).
+// Курс фиксированный и его нужно периодически обновлять вручную под актуальный курс.
+const UAH_PER_USD = 41;
+
 const CASES = {
   anomaly: {
     name: "Аномалия",
@@ -448,7 +465,7 @@ app.post("/telegram-webhook", async (req, res) => {
   }
 });
 
-// Пополнение баланса (пока демо-режим, без настоящей оплаты)
+// Пополнение баланса (демо-режим, оставлен для теста — реальные платежи идут через /api/payment/create)
 app.post("/api/topup", async (req, res) => {
   try {
     const { telegram_id, amount } = req.body;
@@ -462,6 +479,100 @@ app.post("/api/topup", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Создать настоящий криптоплатёж через NOWPayments
+app.post("/api/payment/create", async (req, res) => {
+  try {
+    const { telegram_id, amount_uah } = req.body;
+    if (!amount_uah || amount_uah <= 0) {
+      return res.status(400).json({ error: "Некорректная сумма" });
+    }
+
+    const amount_usd = +(amount_uah / UAH_PER_USD).toFixed(2);
+    const order_id = `topup_${telegram_id}_${Date.now()}`;
+
+    const npRes = await fetch("https://api.nowpayments.io/v1/invoice", {
+      method: "POST",
+      headers: {
+        "x-api-key": process.env.NOWPAYMENTS_API_KEY,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        price_amount: amount_usd,
+        price_currency: "usd",
+        order_id,
+        order_description: "Пополнение баланса CS Cases",
+        ipn_callback_url: "https://cs-cases-backend.onrender.com/nowpayments-webhook"
+      })
+    });
+
+    const npData = await npRes.json();
+    if (!npData.invoice_url) {
+      console.error("Ошибка создания счёта NOWPayments:", npData);
+      return res.status(500).json({ error: "Не удалось создать платёж, попробуй позже" });
+    }
+
+    await pool.query(
+      `INSERT INTO payments (telegram_id, order_id, amount_uah, amount_usd, status)
+       VALUES ($1, $2, $3, $4, 'waiting')`,
+      [telegram_id, order_id, amount_uah, amount_usd]
+    );
+
+    res.json({ invoice_url: npData.invoice_url });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Рекурсивно сортирует ключи объекта по алфавиту — нужно для проверки подписи NOWPayments
+function sortObjectDeep(obj) {
+  if (Array.isArray(obj)) return obj.map(sortObjectDeep);
+  if (obj !== null && typeof obj === "object") {
+    return Object.keys(obj).sort().reduce((acc, key) => {
+      acc[key] = sortObjectDeep(obj[key]);
+      return acc;
+    }, {});
+  }
+  return obj;
+}
+
+// Webhook: сюда NOWPayments присылает уведомления об изменении статуса платежа
+app.post("/nowpayments-webhook", async (req, res) => {
+  try {
+    const signature = req.headers["x-nowpayments-sig"];
+    const sortedBody = sortObjectDeep(req.body);
+    const expectedSignature = crypto
+      .createHmac("sha512", process.env.NOWPAYMENTS_IPN_SECRET)
+      .update(JSON.stringify(sortedBody))
+      .digest("hex");
+
+    if (signature !== expectedSignature) {
+      console.warn("Неверная подпись webhook NOWPayments — запрос отклонён");
+      return res.sendStatus(403);
+    }
+
+    const { order_id, payment_status } = req.body;
+
+    if (payment_status === "finished") {
+      const paymentResult = await pool.query("SELECT * FROM payments WHERE order_id = $1", [order_id]);
+      if (paymentResult.rows.length > 0 && paymentResult.rows[0].status !== "finished") {
+        const payment = paymentResult.rows[0];
+        await pool.query(
+          "UPDATE users SET balance = balance + $1 WHERE telegram_id = $2",
+          [payment.amount_uah, payment.telegram_id]
+        );
+        await pool.query("UPDATE payments SET status = 'finished' WHERE id = $1", [payment.id]);
+        console.log(`Зачислено ${payment.amount_uah} ₴ пользователю ${payment.telegram_id} (заказ ${order_id})`);
+      }
+    }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("Ошибка обработки webhook NOWPayments:", err);
+    res.sendStatus(200); // NOWPayments ждёт 200, иначе будет повторять попытки
   }
 });
 
