@@ -172,22 +172,21 @@ async function answerCallback(callbackQueryId, text) {
 // Курс фиксированный и его нужно периодически обновлять вручную под актуальный курс.
 const UAH_PER_USD = 41;
 
-// Список криптовалют, которые предлагаем для пополнения (код NOWPayments + читаемое название)
+// Список криптовалют для пополнения. min_usd — примерная минимальная сумма платежа для этой сети
+// (зависит от комиссии сети: чем "тяжелее" блокчейн, тем выше минимум). Раз на эти цифры
+// нельзя надёжно положиться через живой запрос к NOWPayments (комиссии сети динамические
+// и API возвращал нестабильные данные), задаём разумные ориентиры вручную — их стоит
+// периодически сверять с реальными комиссиями сетей и подправлять при необходимости.
 const SUPPORTED_CURRENCIES = [
-  { code: "usdttrc20", label: "USDT (TRC20)" },
-  { code: "usdterc20", label: "USDT (ERC20)" },
-  { code: "ton", label: "Toncoin (TON)" },
-  { code: "btc", label: "Bitcoin (BTC)" },
-  { code: "eth", label: "Ethereum (ETH)" },
-  { code: "ltc", label: "Litecoin (LTC)" },
-  { code: "trx", label: "TRON (TRX)" },
-  { code: "doge", label: "Dogecoin (DOGE)" }
+  { code: "usdttrc20", label: "USDT (TRC20)", min_usd: 1 },
+  { code: "ton", label: "Toncoin (TON)", min_usd: 1 },
+  { code: "trx", label: "TRON (TRX)", min_usd: 1 },
+  { code: "ltc", label: "Litecoin (LTC)", min_usd: 2 },
+  { code: "doge", label: "Dogecoin (DOGE)", min_usd: 3 },
+  { code: "usdterc20", label: "USDT (ERC20)", min_usd: 15 },
+  { code: "eth", label: "Ethereum (ETH)", min_usd: 15 },
+  { code: "btc", label: "Bitcoin (BTC)", min_usd: 18 }
 ];
-
-// Кэш минимальных сумм — чтобы не дёргать NOWPayments при каждом открытии экрана пополнения
-let currencyMinCache = null;
-let currencyMinCacheTime = 0;
-const CURRENCY_CACHE_TTL = 60 * 60 * 1000; // 1 час
 
 const CASES = {
   anomaly: {
@@ -500,37 +499,13 @@ app.post("/api/topup", async (req, res) => {
 });
 
 // Список доступных криптовалют с минимальной суммой пополнения в гривне для каждой
-app.get("/api/payment/currencies", async (req, res) => {
-  try {
-    const now = Date.now();
-    if (currencyMinCache && now - currencyMinCacheTime < CURRENCY_CACHE_TTL) {
-      return res.json(currencyMinCache);
-    }
-
-    const results = [];
-    for (const currency of SUPPORTED_CURRENCIES) {
-      try {
-        const npRes = await fetch(
-          `https://api.nowpayments.io/v1/min-amount?currency_from=usd&currency_to=${currency.code}`,
-          { headers: { "x-api-key": process.env.NOWPAYMENTS_API_KEY } }
-        );
-        const npData = await npRes.json();
-        if (npData.min_amount) {
-          const minUah = Math.ceil((npData.min_amount * UAH_PER_USD) / 5) * 5; // округляем до 5 ₴ для красоты
-          results.push({ code: currency.code, label: currency.label, min_uah: minUah });
-        }
-      } catch (innerErr) {
-        console.warn(`Не удалось получить минимальную сумму для ${currency.code}:`, innerErr.message);
-      }
-    }
-
-    currencyMinCache = results;
-    currencyMinCacheTime = now;
-    res.json(results);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Ошибка сервера" });
-  }
+app.get("/api/payment/currencies", (req, res) => {
+  const results = SUPPORTED_CURRENCIES.map(c => ({
+    code: c.code,
+    label: c.label,
+    min_uah: Math.ceil((c.min_usd * UAH_PER_USD) / 5) * 5 // округляем до 5 ₴ для красоты
+  }));
+  res.json(results);
 });
 
 // Создать настоящий криптоплатёж через NOWPayments
