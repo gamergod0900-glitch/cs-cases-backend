@@ -178,14 +178,14 @@ const UAH_PER_USD = 41;
 // и API возвращал нестабильные данные), задаём разумные ориентиры вручную — их стоит
 // периодически сверять с реальными комиссиями сетей и подправлять при необходимости.
 const SUPPORTED_CURRENCIES = [
-  { code: "usdttrc20", label: "USDT (TRC20)", min_usd: 1 },
-  { code: "ton", label: "Toncoin (TON)", min_usd: 1 },
-  { code: "trx", label: "TRON (TRX)", min_usd: 1 },
-  { code: "ltc", label: "Litecoin (LTC)", min_usd: 2 },
-  { code: "doge", label: "Dogecoin (DOGE)", min_usd: 3 },
-  { code: "usdterc20", label: "USDT (ERC20)", min_usd: 15 },
-  { code: "eth", label: "Ethereum (ETH)", min_usd: 15 },
-  { code: "btc", label: "Bitcoin (BTC)", min_usd: 18 }
+  { code: "usdttrc20", label: "USDT (TRC20)", min_usd: 6 },
+  { code: "ton", label: "Toncoin (TON)", min_usd: 6 },
+  { code: "trx", label: "TRON (TRX)", min_usd: 6 },
+  { code: "ltc", label: "Litecoin (LTC)", min_usd: 8 },
+  { code: "doge", label: "Dogecoin (DOGE)", min_usd: 10 },
+  { code: "usdterc20", label: "USDT (ERC20)", min_usd: 20 },
+  { code: "eth", label: "Ethereum (ETH)", min_usd: 20 },
+  { code: "btc", label: "Bitcoin (BTC)", min_usd: 25 }
 ];
 
 const CASES = {
