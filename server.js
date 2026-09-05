@@ -78,7 +78,53 @@ async function initDatabase() {
     );
   `);
 
-  console.log("База данных готова: таблицы users, inventory, openings, withdrawals, payments проверены/созданы");
+  // Чтобы админ-панель могла обновлять то же сообщение в Telegram, что видит владелец
+  await pool.query(`ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS admin_chat_id BIGINT;`);
+  await pool.query(`ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS admin_message_id BIGINT;`);
+
+  // Кейсы теперь хранятся в базе данных, а не в коде — так их можно менять из админ-панели
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS case_defs (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      price INTEGER NOT NULL,
+      image TEXT NOT NULL,
+      sort_order INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS case_items (
+      id SERIAL PRIMARY KEY,
+      case_id TEXT NOT NULL REFERENCES case_defs(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      image TEXT NOT NULL,
+      rarity TEXT NOT NULL,
+      weight INTEGER NOT NULL,
+      value INTEGER NOT NULL
+    );
+  `);
+
+  // Если таблица кейсов ещё пустая — заполняем её текущими тремя кейсами (первый запуск после обновления)
+  const caseCount = await pool.query("SELECT COUNT(*) FROM case_defs");
+  if (parseInt(caseCount.rows[0].count, 10) === 0) {
+    console.log("Таблица кейсов пуста — заполняем стартовыми кейсами...");
+    for (let i = 0; i < SEED_CASES.length; i++) {
+      const c = SEED_CASES[i];
+      await pool.query(
+        "INSERT INTO case_defs (id, name, price, image, sort_order) VALUES ($1, $2, $3, $4, $5)",
+        [c.id, c.name, c.price, c.image, i]
+      );
+      for (const item of c.items) {
+        await pool.query(
+          "INSERT INTO case_items (case_id, name, image, rarity, weight, value) VALUES ($1, $2, $3, $4, $5, $6)",
+          [c.id, item.name, item.image, item.rarity, item.weight, item.value]
+        );
+      }
+    }
+  }
+
+  console.log("База данных готова: таблицы users, inventory, openings, withdrawals, payments, case_defs, case_items проверены/созданы");
 }
 
 // Отправка сообщения владельцу проекта в Telegram через Bot API
@@ -106,10 +152,10 @@ async function notifyAdminWithButton(text, buttonText, callbackData) {
   const adminId = process.env.ADMIN_TELEGRAM_ID;
   if (!token || !adminId) {
     console.warn("BOT_TOKEN или ADMIN_TELEGRAM_ID не заданы — уведомление не отправлено");
-    return;
+    return null;
   }
   try {
-    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -121,8 +167,14 @@ async function notifyAdminWithButton(text, buttonText, callbackData) {
         }
       })
     });
+    const data = await res.json();
+    if (data.ok) {
+      return { chatId: data.result.chat.id, messageId: data.result.message_id };
+    }
+    return null;
   } catch (err) {
     console.error("Не удалось отправить уведомление в Telegram:", err);
+    return null;
   }
 }
 
@@ -167,6 +219,58 @@ async function answerCallback(callbackQueryId, text) {
   }
 }
 
+// Описание содержимого сообщения в Telegram для каждого этапа заявки на вывод
+function withdrawalStageContent(stage, w) {
+  const base = `🎁 <b>Запрос на вывод предмета</b>\n\nПредмет: ${w.item_name}\nЦенность: ${w.item_value} ₴\nСсылка на трейд: ${w.trade_link}\n\n`;
+  if (stage === "accepted") {
+    return { text: base + "Статус: 🔄 В процессе", buttonText: "📤 Трейд отправлен", callbackData: `sent:${w.id}` };
+  }
+  if (stage === "trade_sent") {
+    return { text: base + "Статус: 📤 Трейд отправлен игроку", buttonText: "🎉 Скин получен игроком", callbackData: `done:${w.id}` };
+  }
+  if (stage === "received") {
+    return { text: base + "Статус: ✅ Выполнено, предмет получен игроком", buttonText: null, callbackData: null };
+  }
+  return { text: base + "Статус: ⏳ В обработке", buttonText: "✅ Принял в обработку", callbackData: `accept:${w.id}` };
+}
+
+// Переводит заявку на вывод в новый статус (используется и кнопками в Telegram, и админ-панелью),
+// заодно обновляет то же самое сообщение в Telegram, чтобы обе точки управления оставались синхронными
+async function advanceWithdrawalStatus(withdrawalId, newStage) {
+  const wResult = await pool.query("SELECT * FROM withdrawals WHERE id = $1", [withdrawalId]);
+  if (wResult.rows.length === 0) return null;
+  const withdrawal = wResult.rows[0];
+
+  await pool.query("UPDATE withdrawals SET status = $1 WHERE id = $2", [newStage, withdrawalId]);
+
+  if (newStage === "received") {
+    await pool.query("DELETE FROM inventory WHERE id = $1", [withdrawal.inventory_id]);
+  } else {
+    await pool.query("UPDATE inventory SET withdraw_status = $1 WHERE id = $2", [newStage, withdrawal.inventory_id]);
+  }
+
+  if (withdrawal.admin_chat_id && withdrawal.admin_message_id) {
+    const { text, buttonText, callbackData } = withdrawalStageContent(newStage, withdrawal);
+    await editAdminMessage(withdrawal.admin_chat_id, withdrawal.admin_message_id, text, buttonText, callbackData);
+  }
+
+  const updated = await pool.query("SELECT * FROM withdrawals WHERE id = $1", [withdrawalId]);
+  return updated.rows[0];
+}
+
+// Простая защита админ-эндпоинтов паролем (передаётся в заголовке x-admin-password)
+function requireAdmin(req, res, next) {
+  const password = req.headers["x-admin-password"];
+  if (!process.env.ADMIN_PANEL_PASSWORD) {
+    console.warn("ADMIN_PANEL_PASSWORD не задан — админ-панель отключена");
+    return res.status(500).json({ error: "Админ-панель не настроена на сервере" });
+  }
+  if (password !== process.env.ADMIN_PANEL_PASSWORD) {
+    return res.status(401).json({ error: "Неверный пароль" });
+  }
+  next();
+}
+
 // ===== Описание кейсов и их содержимого (хранится прямо в коде сервера) =====
 // Курс для конвертации гривны в доллары при создании счёта на оплату (NOWPayments принимает суммы в USD).
 // Курс фиксированный и его нужно периодически обновлять вручную под актуальный курс.
@@ -188,10 +292,14 @@ const SUPPORTED_CURRENCIES = [
   { code: "btc", label: "Bitcoin (BTC)", min_usd: 25 }
 ];
 
-const CASES = {
-  anomaly: {
+// Стартовые данные кейсов — используются только один раз, чтобы заполнить пустую базу при первом запуске.
+// После этого все изменения кейсов делаются через админ-панель и хранятся в таблицах case_defs/case_items.
+const SEED_CASES = [
+  {
+    id: "anomaly",
     name: "Аномалия",
     price: 90,
+    image: "images/case-anomaly.png",
     items: [
       { name: "Desert Eagle | Firebreathing", image: "images/skin-deagle-fire.png", rarity: "common", weight: 35, value: 45 },
       { name: "PP-Bizon | Чертёж объекта", image: "images/skin-bizon-blueprint.png", rarity: "common", weight: 30, value: 55 },
@@ -201,9 +309,11 @@ const CASES = {
       { name: "Керамбит | Ультрафиолет", image: "images/skin-karambit-uv.png", rarity: "legendary", weight: 2, value: 1350 }
     ]
   },
-  "blood-mark": {
+  {
+    id: "blood-mark",
     name: "Кровавая Метка",
     price: 60,
+    image: "images/case-blood-mark.png",
     items: [
       { name: "Glock-18 | Карамельное яблоко", image: "images/skin-glock-candy.png", rarity: "common", weight: 35, value: 30 },
       { name: "MAG-7 | Разрушение ядра", image: "images/skin-mag7-core.png", rarity: "common", weight: 27, value: 45 },
@@ -212,9 +322,11 @@ const CASES = {
       { name: "AWP | Градиент", image: "images/skin-awp-gradient.png", rarity: "legendary", weight: 5, value: 900 }
     ]
   },
-  "blue-pulse": {
+  {
+    id: "blue-pulse",
     name: "Синий Импульс",
     price: 100,
+    image: "images/case-blue-pulse.png",
     items: [
       { name: "CZ75-Auto | Полуночная пальма", image: "images/skin-cz75-palm.png", rarity: "common", weight: 32, value: 35 },
       { name: "MAG-7 | Чайка", image: "images/skin-mag7-gull.png", rarity: "common", weight: 28, value: 50 },
@@ -223,7 +335,7 @@ const CASES = {
       { name: "Скелетный нож | Патина", image: "images/skin-skeleton-knife.png", rarity: "legendary", weight: 5, value: 1400 }
     ]
   }
-};
+];
 
 // Честный взвешенный случайный выбор — считается только здесь, на сервере
 function pickWinner(items) {
@@ -269,8 +381,13 @@ app.post("/api/user", async (req, res) => {
 app.post("/api/open-case", async (req, res) => {
   try {
     const { telegram_id, case_id } = req.body;
-    const caseData = CASES[case_id];
-    if (!caseData) return res.status(400).json({ error: "Такого кейса не существует" });
+
+    const caseResult = await pool.query("SELECT * FROM case_defs WHERE id = $1", [case_id]);
+    if (caseResult.rows.length === 0) return res.status(400).json({ error: "Такого кейса не существует" });
+    const caseData = caseResult.rows[0];
+
+    const itemsResult = await pool.query("SELECT * FROM case_items WHERE case_id = $1", [case_id]);
+    if (itemsResult.rows.length === 0) return res.status(400).json({ error: "В этом кейсе нет предметов" });
 
     const userResult = await pool.query("SELECT * FROM users WHERE telegram_id = $1", [telegram_id]);
     if (userResult.rows.length === 0) return res.status(404).json({ error: "Пользователь не найден" });
@@ -280,7 +397,7 @@ app.post("/api/open-case", async (req, res) => {
       return res.status(400).json({ error: "Недостаточно средств" });
     }
 
-    const winner = pickWinner(caseData.items);
+    const winner = pickWinner(itemsResult.rows);
     const newBalance = user.balance - caseData.price;
 
     await pool.query("UPDATE users SET balance = $1 WHERE telegram_id = $2", [newBalance, telegram_id]);
@@ -292,6 +409,34 @@ app.post("/api/open-case", async (req, res) => {
     );
 
     res.json({ item: winner, newBalance });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Публичный список кейсов для главного экрана сайта (картинки, названия, цены и содержимое)
+app.get("/api/cases", async (req, res) => {
+  try {
+    const casesResult = await pool.query("SELECT * FROM case_defs ORDER BY sort_order ASC, name ASC");
+    const cases = [];
+    for (const c of casesResult.rows) {
+      const itemsResult = await pool.query("SELECT * FROM case_items WHERE case_id = $1", [c.id]);
+      cases.push({
+        id: c.id,
+        name: c.name,
+        price: c.price,
+        image: c.image,
+        items: itemsResult.rows.map(i => ({
+          name: i.name,
+          image: i.image,
+          rarity: i.rarity,
+          weight: i.weight,
+          value: i.value
+        }))
+      });
+    }
+    res.json(cases);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Ошибка сервера" });
@@ -404,7 +549,7 @@ app.post("/api/inventory/withdraw", async (req, res) => {
     const withdrawalId = withdrawalResult.rows[0].id;
 
     const userLabel = user.username ? `@${user.username}` : (user.first_name || `ID ${telegram_id}`);
-    await notifyAdminWithButton(
+    const sent = await notifyAdminWithButton(
       `🎁 <b>Запрос на вывод предмета</b>\n\n` +
       `Игрок: ${userLabel} (id ${telegram_id})\n` +
       `Предмет: ${item.item_name}\n` +
@@ -414,6 +559,14 @@ app.post("/api/inventory/withdraw", async (req, res) => {
       "✅ Принял в обработку",
       `accept:${withdrawalId}`
     );
+
+    // Сохраняем, какое именно сообщение отправили — понадобится, чтобы редактировать его позже
+    if (sent) {
+      await pool.query(
+        "UPDATE withdrawals SET admin_chat_id = $1, admin_message_id = $2 WHERE id = $3",
+        [sent.chatId, sent.messageId, withdrawalId]
+      );
+    }
 
     res.json({ success: true });
   } catch (err) {
@@ -432,47 +585,26 @@ app.post("/telegram-webhook", async (req, res) => {
 
     const [action, withdrawalIdStr] = (callback.data || "").split(":");
     const withdrawalId = parseInt(withdrawalIdStr, 10);
-    const chatId = callback.message.chat.id;
-    const messageId = callback.message.message_id;
+    const stageMap = { accept: "accepted", sent: "trade_sent", done: "received" };
+    const newStage = stageMap[action];
 
-    const wResult = await pool.query("SELECT * FROM withdrawals WHERE id = $1", [withdrawalId]);
-    if (wResult.rows.length === 0) {
+    if (!newStage) {
+      await answerCallback(callback.id, "Неизвестное действие");
+      return res.sendStatus(200);
+    }
+
+    const updated = await advanceWithdrawalStatus(withdrawalId, newStage);
+    if (!updated) {
       await answerCallback(callback.id, "Заявка не найдена");
       return res.sendStatus(200);
     }
-    const withdrawal = wResult.rows[0];
 
-    if (action === "accept") {
-      await pool.query("UPDATE withdrawals SET status = 'accepted' WHERE id = $1", [withdrawalId]);
-      await pool.query("UPDATE inventory SET withdraw_status = 'accepted' WHERE id = $1", [withdrawal.inventory_id]);
-      await editAdminMessage(
-        chatId, messageId,
-        `🎁 <b>Запрос на вывод предмета</b>\n\nПредмет: ${withdrawal.item_name}\nЦенность: ${withdrawal.item_value} ₴\nСсылка на трейд: ${withdrawal.trade_link}\n\nСтатус: 🔄 В процессе`,
-        "📤 Трейд отправлен",
-        `sent:${withdrawalId}`
-      );
-      await answerCallback(callback.id, "Отмечено как «в процессе»");
-    } else if (action === "sent") {
-      await pool.query("UPDATE withdrawals SET status = 'trade_sent' WHERE id = $1", [withdrawalId]);
-      await pool.query("UPDATE inventory SET withdraw_status = 'trade_sent' WHERE id = $1", [withdrawal.inventory_id]);
-      await editAdminMessage(
-        chatId, messageId,
-        `🎁 <b>Запрос на вывод предмета</b>\n\nПредмет: ${withdrawal.item_name}\nЦенность: ${withdrawal.item_value} ₴\nСсылка на трейд: ${withdrawal.trade_link}\n\nСтатус: 📤 Трейд отправлен игроку`,
-        "🎉 Скин получен игроком",
-        `done:${withdrawalId}`
-      );
-      await answerCallback(callback.id, "Отмечено как «трейд отправлен»");
-    } else if (action === "done") {
-      await pool.query("UPDATE withdrawals SET status = 'received' WHERE id = $1", [withdrawalId]);
-      // Только теперь предмет реально удаляется из инвентаря игрока
-      await pool.query("DELETE FROM inventory WHERE id = $1", [withdrawal.inventory_id]);
-      await editAdminMessage(
-        chatId, messageId,
-        `🎁 <b>Запрос на вывод предмета</b>\n\nПредмет: ${withdrawal.item_name}\nЦенность: ${withdrawal.item_value} ₴\n\nСтатус: ✅ Выполнено, предмет получен игроком`,
-        null, null
-      );
-      await answerCallback(callback.id, "Вывод завершён ✅");
-    }
+    const confirmText = {
+      accepted: "Отмечено как «в процессе»",
+      trade_sent: "Отмечено как «трейд отправлен»",
+      received: "Вывод завершён ✅"
+    }[newStage];
+    await answerCallback(callback.id, confirmText);
 
     res.sendStatus(200);
   } catch (err) {
@@ -603,6 +735,189 @@ app.post("/nowpayments-webhook", async (req, res) => {
   } catch (err) {
     console.error("Ошибка обработки webhook NOWPayments:", err);
     res.sendStatus(200); // NOWPayments ждёт 200, иначе будет повторять попытки
+  }
+});
+
+// ================== АДМИН-ПАНЕЛЬ ==================
+// Все маршруты ниже защищены паролем (заголовок x-admin-password), см. requireAdmin выше
+
+// Проверка пароля (используется формой входа в панели)
+app.post("/api/admin/login", requireAdmin, (req, res) => {
+  res.json({ success: true });
+});
+
+// --- Заявки на вывод ---
+app.get("/api/admin/withdrawals", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT w.*, u.first_name, u.username
+      FROM withdrawals w
+      LEFT JOIN users u ON u.telegram_id = w.telegram_id
+      ORDER BY w.requested_at DESC
+      LIMIT 200
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+app.post("/api/admin/withdrawals/:id/status", requireAdmin, async (req, res) => {
+  try {
+    const { status } = req.body; // ожидается: accepted | trade_sent | received
+    if (!["accepted", "trade_sent", "received"].includes(status)) {
+      return res.status(400).json({ error: "Некорректный статус" });
+    }
+    const updated = await advanceWithdrawalStatus(req.params.id, status);
+    if (!updated) return res.status(404).json({ error: "Заявка не найдена" });
+    res.json(updated);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// --- Пользователи ---
+app.get("/api/admin/users", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT u.telegram_id, u.first_name, u.username, u.balance, u.created_at,
+        (SELECT COUNT(*) FROM openings o WHERE o.telegram_id = u.telegram_id) AS cases_opened,
+        (SELECT COUNT(*) FROM inventory i WHERE i.telegram_id = u.telegram_id) AS inventory_count
+      FROM users u
+      ORDER BY u.created_at DESC
+      LIMIT 300
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+app.post("/api/admin/users/:telegram_id/balance", requireAdmin, async (req, res) => {
+  try {
+    const { balance } = req.body;
+    if (balance === undefined || balance < 0) {
+      return res.status(400).json({ error: "Некорректный баланс" });
+    }
+    const result = await pool.query(
+      "UPDATE users SET balance = $1 WHERE telegram_id = $2 RETURNING *",
+      [balance, req.params.telegram_id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Пользователь не найден" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// --- Управление кейсами ---
+app.get("/api/admin/cases", requireAdmin, async (req, res) => {
+  try {
+    const casesResult = await pool.query("SELECT * FROM case_defs ORDER BY sort_order ASC, name ASC");
+    const cases = [];
+    for (const c of casesResult.rows) {
+      const itemsResult = await pool.query("SELECT * FROM case_items WHERE case_id = $1 ORDER BY value DESC", [c.id]);
+      cases.push({ ...c, items: itemsResult.rows });
+    }
+    res.json(cases);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+app.post("/api/admin/cases", requireAdmin, async (req, res) => {
+  try {
+    const { id, name, price, image, items } = req.body;
+    if (!id || !name || !price || !image || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Заполни все поля кейса и добавь хотя бы один предмет" });
+    }
+
+    const existing = await pool.query("SELECT id FROM case_defs WHERE id = $1", [id]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: "Кейс с таким ID уже существует" });
+    }
+
+    const countResult = await pool.query("SELECT COUNT(*) FROM case_defs");
+    const sortOrder = parseInt(countResult.rows[0].count, 10);
+
+    await pool.query(
+      "INSERT INTO case_defs (id, name, price, image, sort_order) VALUES ($1, $2, $3, $4, $5)",
+      [id, name, price, image, sortOrder]
+    );
+    for (const item of items) {
+      await pool.query(
+        "INSERT INTO case_items (case_id, name, image, rarity, weight, value) VALUES ($1, $2, $3, $4, $5, $6)",
+        [id, item.name, item.image, item.rarity, item.weight, item.value]
+      );
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+app.put("/api/admin/cases/:id", requireAdmin, async (req, res) => {
+  try {
+    const { name, price, image, items } = req.body;
+    if (!name || !price || !image || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Заполни все поля кейса и добавь хотя бы один предмет" });
+    }
+
+    const existing = await pool.query("SELECT id FROM case_defs WHERE id = $1", [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Кейс не найден" });
+
+    await pool.query(
+      "UPDATE case_defs SET name = $1, price = $2, image = $3 WHERE id = $4",
+      [name, price, image, req.params.id]
+    );
+
+    // Проще всего полностью пересоздать список предметов кейса при редактировании
+    await pool.query("DELETE FROM case_items WHERE case_id = $1", [req.params.id]);
+    for (const item of items) {
+      await pool.query(
+        "INSERT INTO case_items (case_id, name, image, rarity, weight, value) VALUES ($1, $2, $3, $4, $5, $6)",
+        [req.params.id, item.name, item.image, item.rarity, item.weight, item.value]
+      );
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+app.delete("/api/admin/cases/:id", requireAdmin, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM case_defs WHERE id = $1", [req.params.id]); // case_items удалятся сами (ON DELETE CASCADE)
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// --- История платежей ---
+app.get("/api/admin/payments", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT p.*, u.first_name, u.username
+      FROM payments p
+      LEFT JOIN users u ON u.telegram_id = p.telegram_id
+      ORDER BY p.created_at DESC
+      LIMIT 300
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
   }
 });
 
