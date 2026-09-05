@@ -814,6 +814,20 @@ app.post("/api/admin/users/:telegram_id/balance", requireAdmin, async (req, res)
   }
 });
 
+// Инвентарь конкретного пользователя — для просмотра из админ-панели
+app.get("/api/admin/users/:telegram_id/inventory", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM inventory WHERE telegram_id = $1 ORDER BY added_at DESC",
+      [req.params.telegram_id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
 // --- Управление кейсами ---
 app.get("/api/admin/cases", requireAdmin, async (req, res) => {
   try {
