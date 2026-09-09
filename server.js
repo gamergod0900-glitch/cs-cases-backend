@@ -105,6 +105,17 @@ async function initDatabase() {
     );
   `);
 
+  // Обращения в поддержку, отправленные игроками из мини-аппа
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS support_requests (
+      id SERIAL PRIMARY KEY,
+      telegram_id BIGINT NOT NULL REFERENCES users(telegram_id),
+      message TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
   // Если таблица кейсов ещё пустая — заполняем её текущими тремя кейсами (первый запуск после обновления)
   const caseCount = await pool.query("SELECT COUNT(*) FROM case_defs");
   if (parseInt(caseCount.rows[0].count, 10) === 0) {
@@ -124,7 +135,7 @@ async function initDatabase() {
     }
   }
 
-  console.log("База данных готова: таблицы users, inventory, openings, withdrawals, payments, case_defs, case_items проверены/созданы");
+  console.log("База данных готова: таблицы users, inventory, openings, withdrawals, payments, case_defs, case_items, support_requests проверены/созданы");
 }
 
 // Отправка сообщения владельцу проекта в Telegram через Bot API
@@ -575,6 +586,38 @@ app.post("/api/inventory/withdraw", async (req, res) => {
   }
 });
 
+// Отправить обращение в поддержку (падает в БД + уведомление владельцу в Telegram)
+app.post("/api/support", async (req, res) => {
+  try {
+    const { telegram_id, message } = req.body;
+    if (!telegram_id) return res.status(400).json({ error: "telegram_id обязателен" });
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: "Опиши свою проблему" });
+    }
+
+    const userResult = await pool.query("SELECT * FROM users WHERE telegram_id = $1", [telegram_id]);
+    if (userResult.rows.length === 0) return res.status(404).json({ error: "Пользователь не найден" });
+    const user = userResult.rows[0];
+
+    await pool.query(
+      "INSERT INTO support_requests (telegram_id, message) VALUES ($1, $2)",
+      [telegram_id, message.trim()]
+    );
+
+    const userLabel = user.username ? `@${user.username}` : (user.first_name || `ID ${telegram_id}`);
+    await notifyAdmin(
+      `🆘 <b>Новое обращение в поддержку</b>\n\n` +
+      `Игрок: ${userLabel} (id ${telegram_id})\n` +
+      `Сообщение: ${message.trim()}`
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
 // ===== Webhook: сюда Telegram присылает нажатия кнопок администратором =====
 app.post("/telegram-webhook", async (req, res) => {
   try {
@@ -929,6 +972,41 @@ app.get("/api/admin/payments", requireAdmin, async (req, res) => {
       LIMIT 300
     `);
     res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// --- Обращения в поддержку ---
+app.get("/api/admin/support", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT s.*, u.first_name, u.username
+      FROM support_requests s
+      LEFT JOIN users u ON u.telegram_id = s.telegram_id
+      ORDER BY s.created_at DESC
+      LIMIT 300
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+app.post("/api/admin/support/:id/status", requireAdmin, async (req, res) => {
+  try {
+    const { status } = req.body; // ожидается: open | resolved
+    if (!["open", "resolved"].includes(status)) {
+      return res.status(400).json({ error: "Некорректный статус" });
+    }
+    const result = await pool.query(
+      "UPDATE support_requests SET status = $1 WHERE id = $2 RETURNING *",
+      [status, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Обращение не найдено" });
+    res.json(result.rows[0]);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Ошибка сервера" });
