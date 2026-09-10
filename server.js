@@ -105,14 +105,16 @@ async function initDatabase() {
     );
   `);
 
-  // Обращения в поддержку, отправленные игроками из мини-аппа
+  // Чат поддержки: каждое сообщение — либо от игрока, либо от админа, привязано к telegram_id игрока
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS support_requests (
+    CREATE TABLE IF NOT EXISTS support_messages (
       id SERIAL PRIMARY KEY,
       telegram_id BIGINT NOT NULL REFERENCES users(telegram_id),
+      sender TEXT NOT NULL, -- 'user' или 'admin'
       message TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'open',
-      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      read_by_admin BOOLEAN NOT NULL DEFAULT FALSE,
+      read_by_user BOOLEAN NOT NULL DEFAULT FALSE
     );
   `);
 
@@ -135,7 +137,7 @@ async function initDatabase() {
     }
   }
 
-  console.log("База данных готова: таблицы users, inventory, openings, withdrawals, payments, case_defs, case_items, support_requests проверены/созданы");
+  console.log("База данных готова: таблицы users, inventory, openings, withdrawals, payments, case_defs, case_items, support_messages проверены/созданы");
 }
 
 // Отправка сообщения владельцу проекта в Telegram через Bot API
@@ -154,6 +156,25 @@ async function notifyAdmin(text) {
     });
   } catch (err) {
     console.error("Не удалось отправить уведомление в Telegram:", err);
+  }
+}
+
+// Отправка сообщения конкретному игроку в Telegram (используется для ответов поддержки).
+// Сработает только если игрок хотя бы раз запускал бота — что верно для всех, кто открывал мини-апп.
+async function notifyUser(telegramId, text) {
+  const token = process.env.BOT_TOKEN;
+  if (!token) {
+    console.warn("BOT_TOKEN не задан — сообщение игроку не отправлено");
+    return;
+  }
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: telegramId, text, parse_mode: "HTML" })
+    });
+  } catch (err) {
+    console.error("Не удалось отправить сообщение игроку:", err);
   }
 }
 
@@ -586,13 +607,15 @@ app.post("/api/inventory/withdraw", async (req, res) => {
   }
 });
 
-// Отправить обращение в поддержку (падает в БД + уведомление владельцу в Telegram)
-app.post("/api/support", async (req, res) => {
+// ===== Чат поддержки (сторона игрока) =====
+
+// Отправить сообщение в поддержку — падает в БД + уведомление владельцу в Telegram
+app.post("/api/support/send", async (req, res) => {
   try {
     const { telegram_id, message } = req.body;
     if (!telegram_id) return res.status(400).json({ error: "telegram_id обязателен" });
     if (!message || !message.trim()) {
-      return res.status(400).json({ error: "Опиши свою проблему" });
+      return res.status(400).json({ error: "Напиши сообщение" });
     }
 
     const userResult = await pool.query("SELECT * FROM users WHERE telegram_id = $1", [telegram_id]);
@@ -600,18 +623,37 @@ app.post("/api/support", async (req, res) => {
     const user = userResult.rows[0];
 
     await pool.query(
-      "INSERT INTO support_requests (telegram_id, message) VALUES ($1, $2)",
+      "INSERT INTO support_messages (telegram_id, sender, message, read_by_user) VALUES ($1, 'user', $2, TRUE)",
       [telegram_id, message.trim()]
     );
 
     const userLabel = user.username ? `@${user.username}` : (user.first_name || `ID ${telegram_id}`);
     await notifyAdmin(
-      `🆘 <b>Новое обращение в поддержку</b>\n\n` +
+      `🆘 <b>Сообщение в поддержку</b>\n\n` +
       `Игрок: ${userLabel} (id ${telegram_id})\n` +
       `Сообщение: ${message.trim()}`
     );
 
     res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Получить историю переписки конкретного игрока (используется чатом в мини-аппе, опрашивается регулярно)
+app.get("/api/support/messages/:telegram_id", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM support_messages WHERE telegram_id = $1 ORDER BY created_at ASC",
+      [req.params.telegram_id]
+    );
+    // Отмечаем ответы админа прочитанными, раз игрок сейчас смотрит чат
+    await pool.query(
+      "UPDATE support_messages SET read_by_user = TRUE WHERE telegram_id = $1 AND sender = 'admin' AND read_by_user = FALSE",
+      [req.params.telegram_id]
+    );
+    res.json(result.rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Ошибка сервера" });
@@ -978,15 +1020,23 @@ app.get("/api/admin/payments", requireAdmin, async (req, res) => {
   }
 });
 
-// --- Обращения в поддержку ---
-app.get("/api/admin/support", requireAdmin, async (req, res) => {
+// --- Чат поддержки (сторона админа) ---
+
+// Список диалогов: по одному на игрока, с последним сообщением и числом непрочитанных
+app.get("/api/admin/support/conversations", requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT s.*, u.first_name, u.username
-      FROM support_requests s
-      LEFT JOIN users u ON u.telegram_id = s.telegram_id
-      ORDER BY s.created_at DESC
-      LIMIT 300
+      SELECT
+        t.telegram_id,
+        u.first_name,
+        u.username,
+        (SELECT message FROM support_messages m WHERE m.telegram_id = t.telegram_id ORDER BY m.created_at DESC LIMIT 1) AS last_message,
+        (SELECT sender FROM support_messages m WHERE m.telegram_id = t.telegram_id ORDER BY m.created_at DESC LIMIT 1) AS last_sender,
+        (SELECT created_at FROM support_messages m WHERE m.telegram_id = t.telegram_id ORDER BY m.created_at DESC LIMIT 1) AS last_at,
+        (SELECT COUNT(*) FROM support_messages m WHERE m.telegram_id = t.telegram_id AND m.sender = 'user' AND m.read_by_admin = FALSE) AS unread_count
+      FROM (SELECT DISTINCT telegram_id FROM support_messages) t
+      LEFT JOIN users u ON u.telegram_id = t.telegram_id
+      ORDER BY last_at DESC
     `);
     res.json(result.rows);
   } catch (err) {
@@ -995,18 +1045,42 @@ app.get("/api/admin/support", requireAdmin, async (req, res) => {
   }
 });
 
-app.post("/api/admin/support/:id/status", requireAdmin, async (req, res) => {
+// Полная переписка с конкретным игроком (открывается при клике на диалог)
+app.get("/api/admin/support/:telegram_id/messages", requireAdmin, async (req, res) => {
   try {
-    const { status } = req.body; // ожидается: open | resolved
-    if (!["open", "resolved"].includes(status)) {
-      return res.status(400).json({ error: "Некорректный статус" });
-    }
     const result = await pool.query(
-      "UPDATE support_requests SET status = $1 WHERE id = $2 RETURNING *",
-      [status, req.params.id]
+      "SELECT * FROM support_messages WHERE telegram_id = $1 ORDER BY created_at ASC",
+      [req.params.telegram_id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: "Обращение не найдено" });
-    res.json(result.rows[0]);
+    // Отмечаем сообщения игрока прочитанными, раз админ сейчас смотрит переписку
+    await pool.query(
+      "UPDATE support_messages SET read_by_admin = TRUE WHERE telegram_id = $1 AND sender = 'user' AND read_by_admin = FALSE",
+      [req.params.telegram_id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Отправить ответ игроку — сохраняется в БД и сразу улетает игроку в Telegram
+app.post("/api/admin/support/:telegram_id/send", requireAdmin, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: "Введи текст ответа" });
+    }
+    const telegramId = req.params.telegram_id;
+
+    await pool.query(
+      "INSERT INTO support_messages (telegram_id, sender, message, read_by_admin) VALUES ($1, 'admin', $2, TRUE)",
+      [telegramId, message.trim()]
+    );
+
+    await notifyUser(telegramId, `💬 <b>Ответ поддержки</b>\n\n${message.trim()}`);
+
+    res.json({ success: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Ошибка сервера" });
