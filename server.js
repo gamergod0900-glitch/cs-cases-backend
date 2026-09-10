@@ -118,6 +118,15 @@ async function initDatabase() {
     );
   `);
 
+  // Статус диалога поддержки — один на игрока: new (новый) | in_progress (в работе) | closed (завершён)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS support_conversations (
+      telegram_id BIGINT PRIMARY KEY REFERENCES users(telegram_id),
+      status TEXT NOT NULL DEFAULT 'new',
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
   // Если таблица кейсов ещё пустая — заполняем её текущими тремя кейсами (первый запуск после обновления)
   const caseCount = await pool.query("SELECT COUNT(*) FROM case_defs");
   if (parseInt(caseCount.rows[0].count, 10) === 0) {
@@ -137,7 +146,7 @@ async function initDatabase() {
     }
   }
 
-  console.log("База данных готова: таблицы users, inventory, openings, withdrawals, payments, case_defs, case_items, support_messages проверены/созданы");
+  console.log("База данных готова: таблицы users, inventory, openings, withdrawals, payments, case_defs, case_items, support_messages, support_conversations проверены/созданы");
 }
 
 // Отправка сообщения владельцу проекта в Telegram через Bot API
@@ -609,7 +618,8 @@ app.post("/api/inventory/withdraw", async (req, res) => {
 
 // ===== Чат поддержки (сторона игрока) =====
 
-// Отправить сообщение в поддержку — падает в БД + уведомление владельцу в Telegram
+// Отправить сообщение в поддержку — падает в БД + уведомление владельцу в Telegram.
+// Если диалог был ранее закрыт, а игрок написал снова — автоматически "переоткрываем" его (статус 'new').
 app.post("/api/support/send", async (req, res) => {
   try {
     const { telegram_id, message } = req.body;
@@ -625,6 +635,15 @@ app.post("/api/support/send", async (req, res) => {
     await pool.query(
       "INSERT INTO support_messages (telegram_id, sender, message, read_by_user) VALUES ($1, 'user', $2, TRUE)",
       [telegram_id, message.trim()]
+    );
+
+    await pool.query(
+      `INSERT INTO support_conversations (telegram_id, status, updated_at)
+       VALUES ($1, 'new', NOW())
+       ON CONFLICT (telegram_id) DO UPDATE SET
+         status = CASE WHEN support_conversations.status = 'closed' THEN 'new' ELSE support_conversations.status END,
+         updated_at = NOW()`,
+      [telegram_id]
     );
 
     const userLabel = user.username ? `@${user.username}` : (user.first_name || `ID ${telegram_id}`);
@@ -1022,21 +1041,26 @@ app.get("/api/admin/payments", requireAdmin, async (req, res) => {
 
 // --- Чат поддержки (сторона админа) ---
 
-// Список диалогов: по одному на игрока, с последним сообщением и числом непрочитанных
+// Список диалогов: по одному на игрока, с последним сообщением, числом непрочитанных и статусом.
+// По умолчанию закрытые диалоги скрыты — передай ?include_closed=true, чтобы увидеть архив.
 app.get("/api/admin/support/conversations", requireAdmin, async (req, res) => {
   try {
+    const includeClosed = req.query.include_closed === "true";
+    const statusFilter = includeClosed ? "" : "WHERE sc.status != 'closed'";
     const result = await pool.query(`
       SELECT
-        t.telegram_id,
+        sc.telegram_id,
+        sc.status,
         u.first_name,
         u.username,
-        (SELECT message FROM support_messages m WHERE m.telegram_id = t.telegram_id ORDER BY m.created_at DESC LIMIT 1) AS last_message,
-        (SELECT sender FROM support_messages m WHERE m.telegram_id = t.telegram_id ORDER BY m.created_at DESC LIMIT 1) AS last_sender,
-        (SELECT created_at FROM support_messages m WHERE m.telegram_id = t.telegram_id ORDER BY m.created_at DESC LIMIT 1) AS last_at,
-        (SELECT COUNT(*) FROM support_messages m WHERE m.telegram_id = t.telegram_id AND m.sender = 'user' AND m.read_by_admin = FALSE) AS unread_count
-      FROM (SELECT DISTINCT telegram_id FROM support_messages) t
-      LEFT JOIN users u ON u.telegram_id = t.telegram_id
-      ORDER BY last_at DESC
+        (SELECT message FROM support_messages m WHERE m.telegram_id = sc.telegram_id ORDER BY m.created_at DESC LIMIT 1) AS last_message,
+        (SELECT sender FROM support_messages m WHERE m.telegram_id = sc.telegram_id ORDER BY m.created_at DESC LIMIT 1) AS last_sender,
+        (SELECT created_at FROM support_messages m WHERE m.telegram_id = sc.telegram_id ORDER BY m.created_at DESC LIMIT 1) AS last_at,
+        (SELECT COUNT(*) FROM support_messages m WHERE m.telegram_id = sc.telegram_id AND m.sender = 'user' AND m.read_by_admin = FALSE) AS unread_count
+      FROM support_conversations sc
+      LEFT JOIN users u ON u.telegram_id = sc.telegram_id
+      ${statusFilter}
+      ORDER BY sc.updated_at DESC
     `);
     res.json(result.rows);
   } catch (err) {
@@ -1045,10 +1069,10 @@ app.get("/api/admin/support/conversations", requireAdmin, async (req, res) => {
   }
 });
 
-// Полная переписка с конкретным игроком (открывается при клике на диалог)
+// Полная переписка с конкретным игроком + текущий статус диалога (открывается при клике на диалог)
 app.get("/api/admin/support/:telegram_id/messages", requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query(
+    const messagesResult = await pool.query(
       "SELECT * FROM support_messages WHERE telegram_id = $1 ORDER BY created_at ASC",
       [req.params.telegram_id]
     );
@@ -1057,14 +1081,19 @@ app.get("/api/admin/support/:telegram_id/messages", requireAdmin, async (req, re
       "UPDATE support_messages SET read_by_admin = TRUE WHERE telegram_id = $1 AND sender = 'user' AND read_by_admin = FALSE",
       [req.params.telegram_id]
     );
-    res.json(result.rows);
+    const statusResult = await pool.query(
+      "SELECT status FROM support_conversations WHERE telegram_id = $1",
+      [req.params.telegram_id]
+    );
+    const status = statusResult.rows.length ? statusResult.rows[0].status : "new";
+    res.json({ messages: messagesResult.rows, status });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Ошибка сервера" });
   }
 });
 
-// Отправить ответ игроку — сохраняется в БД и сразу улетает игроку в Telegram
+// Отправить ответ игроку — сохраняется в БД, улетает игроку в Telegram, диалог помечается "в работе"
 app.post("/api/admin/support/:telegram_id/send", requireAdmin, async (req, res) => {
   try {
     const { message } = req.body;
@@ -1078,7 +1107,69 @@ app.post("/api/admin/support/:telegram_id/send", requireAdmin, async (req, res) 
       [telegramId, message.trim()]
     );
 
+    await pool.query(
+      `INSERT INTO support_conversations (telegram_id, status, updated_at)
+       VALUES ($1, 'in_progress', NOW())
+       ON CONFLICT (telegram_id) DO UPDATE SET status = 'in_progress', updated_at = NOW()`,
+      [telegramId]
+    );
+
     await notifyUser(telegramId, `💬 <b>Ответ поддержки</b>\n\n${message.trim()}`);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Взять диалог на рассмотрение — статус 'in_progress' + системное сообщение игроку
+app.post("/api/admin/support/:telegram_id/claim", requireAdmin, async (req, res) => {
+  try {
+    const telegramId = req.params.telegram_id;
+
+    await pool.query(
+      `INSERT INTO support_conversations (telegram_id, status, updated_at)
+       VALUES ($1, 'in_progress', NOW())
+       ON CONFLICT (telegram_id) DO UPDATE SET status = 'in_progress', updated_at = NOW()`,
+      [telegramId]
+    );
+
+    const noticeText = "Ваша заявка взята на рассмотрение. Ожидайте ответа.";
+    await pool.query(
+      "INSERT INTO support_messages (telegram_id, sender, message, read_by_admin) VALUES ($1, 'system', $2, TRUE)",
+      [telegramId, noticeText]
+    );
+
+    await notifyUser(telegramId, `🔍 ${noticeText}`);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Завершить диалог — статус 'closed', диалог уходит из активного списка. Сообщения НЕ удаляются:
+// у игрока в чате остаётся вся история + системное сообщение о завершении.
+app.post("/api/admin/support/:telegram_id/close", requireAdmin, async (req, res) => {
+  try {
+    const telegramId = req.params.telegram_id;
+
+    await pool.query(
+      `INSERT INTO support_conversations (telegram_id, status, updated_at)
+       VALUES ($1, 'closed', NOW())
+       ON CONFLICT (telegram_id) DO UPDATE SET status = 'closed', updated_at = NOW()`,
+      [telegramId]
+    );
+
+    const noticeText = "Администратор завершил диалог, так как ваша проблема решена.";
+    await pool.query(
+      "INSERT INTO support_messages (telegram_id, sender, message, read_by_admin) VALUES ($1, 'system', $2, TRUE)",
+      [telegramId, noticeText]
+    );
+
+    await notifyUser(telegramId, `✅ ${noticeText}`);
 
     res.json({ success: true });
   } catch (err) {
