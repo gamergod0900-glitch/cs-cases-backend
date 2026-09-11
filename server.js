@@ -6,6 +6,7 @@ const crypto = require("crypto");
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // нужно для webhook LiqPay (шлёт form-encoded данные)
 
 // Подключение к базе данных (строка берётся из переменной окружения DATABASE_URL)
 const pool = new Pool({
@@ -77,6 +78,9 @@ async function initDatabase() {
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
   `);
+  // Способ оплаты и количество Stars (если оплата через Telegram Stars)
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS method TEXT NOT NULL DEFAULT 'crypto';`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS amount_stars INTEGER;`);
 
   // Чтобы админ-панель могла обновлять то же сообщение в Telegram, что видит владелец
   await pool.query(`ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS admin_chat_id BIGINT;`);
@@ -245,6 +249,45 @@ async function editAdminMessage(chatId, messageId, text, buttonText, callbackDat
   }
 }
 
+// Подтверждение перед оплатой Telegram Stars — Telegram требует ответ в течение 10 секунд
+async function answerPreCheckoutQuery(preCheckoutQueryId, ok, errorMessage) {
+  const token = process.env.BOT_TOKEN;
+  if (!token) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/answerPreCheckoutQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pre_checkout_query_id: preCheckoutQueryId,
+        ok,
+        ...(errorMessage ? { error_message: errorMessage } : {})
+      })
+    });
+  } catch (err) {
+    console.error("Не удалось ответить на pre_checkout_query:", err);
+  }
+}
+
+// Зачисляет оплаченный платёж на баланс по order_id — общая логика для крипты, карты и Stars.
+// Идемпотентна: если платёж уже зачислен (status='finished'), повторный вызов ничего не делает.
+async function creditPaymentByOrderId(orderId) {
+  const paymentResult = await pool.query("SELECT * FROM payments WHERE order_id = $1", [orderId]);
+  if (paymentResult.rows.length === 0) {
+    console.warn(`Платёж с order_id=${orderId} не найден`);
+    return false;
+  }
+  const payment = paymentResult.rows[0];
+  if (payment.status === "finished") return true; // уже зачислено
+
+  await pool.query(
+    "UPDATE users SET balance = balance + $1 WHERE telegram_id = $2",
+    [payment.amount_uah, payment.telegram_id]
+  );
+  await pool.query("UPDATE payments SET status = 'finished' WHERE id = $1", [payment.id]);
+  console.log(`Зачислено ${payment.amount_uah} ₴ пользователю ${payment.telegram_id} (заказ ${orderId})`);
+  return true;
+}
+
 // Подтверждение нажатия кнопки (убирает "часики" на кнопке у администратора)
 async function answerCallback(callbackQueryId, text) {
   const token = process.env.BOT_TOKEN;
@@ -316,6 +359,30 @@ function requireAdmin(req, res, next) {
 // Курс для конвертации гривны в доллары при создании счёта на оплату (NOWPayments принимает суммы в USD).
 // Курс фиксированный и его нужно периодически обновлять вручную под актуальный курс.
 const UAH_PER_USD = 41;
+
+// ===== Оплата картой (LiqPay) =====
+// Публичный и приватный ключи из личного кабинета LiqPay (liqpay.ua) — задаются в переменных окружения
+const LIQPAY_PUBLIC_KEY = process.env.LIQPAY_PUBLIC_KEY;
+const LIQPAY_PRIVATE_KEY = process.env.LIQPAY_PRIVATE_KEY;
+const LIQPAY_MIN_UAH = 20; // минимальная сумма пополнения картой
+
+function liqpaySignature(data) {
+  return crypto.createHash("sha1").update(LIQPAY_PRIVATE_KEY + data + LIQPAY_PRIVATE_KEY).digest("base64");
+}
+
+// ===== Оплата Telegram Stars =====
+// Ориентировочный курс — Telegram официально не публикует фиксированную цену звезды в USD,
+// но на практике она составляет около $0.013. Стоит периодически сверять и подправлять.
+const STAR_USD_RATE = 0.013;
+const STARS_MIN = 50; // минимальное количество звёзд для пополнения
+
+function uahToStars(amountUah) {
+  return Math.ceil((amountUah / UAH_PER_USD) / STAR_USD_RATE);
+}
+
+function starsMinUah() {
+  return Math.ceil(STARS_MIN * STAR_USD_RATE * UAH_PER_USD);
+}
 
 // Список криптовалют для пополнения. min_usd — примерная минимальная сумма платежа для этой сети
 // (зависит от комиссии сети: чем "тяжелее" блокчейн, тем выше минимум). Раз на эти цифры
@@ -679,38 +746,52 @@ app.get("/api/support/messages/:telegram_id", async (req, res) => {
   }
 });
 
-// ===== Webhook: сюда Telegram присылает нажатия кнопок администратором =====
+// ===== Webhook: сюда Telegram присылает нажатия кнопок, а также события оплаты Stars =====
 app.post("/telegram-webhook", async (req, res) => {
   try {
-    const callback = req.body.callback_query;
-    if (!callback) {
-      return res.sendStatus(200); // не связанное с нами обновление — просто подтверждаем получение
-    }
+    // 1. Нажатие кнопки в сообщении администратору (заявки на вывод)
+    if (req.body.callback_query) {
+      const callback = req.body.callback_query;
+      const [action, withdrawalIdStr] = (callback.data || "").split(":");
+      const withdrawalId = parseInt(withdrawalIdStr, 10);
+      const stageMap = { accept: "accepted", sent: "trade_sent", done: "received" };
+      const newStage = stageMap[action];
 
-    const [action, withdrawalIdStr] = (callback.data || "").split(":");
-    const withdrawalId = parseInt(withdrawalIdStr, 10);
-    const stageMap = { accept: "accepted", sent: "trade_sent", done: "received" };
-    const newStage = stageMap[action];
+      if (!newStage) {
+        await answerCallback(callback.id, "Неизвестное действие");
+        return res.sendStatus(200);
+      }
 
-    if (!newStage) {
-      await answerCallback(callback.id, "Неизвестное действие");
+      const updated = await advanceWithdrawalStatus(withdrawalId, newStage);
+      if (!updated) {
+        await answerCallback(callback.id, "Заявка не найдена");
+        return res.sendStatus(200);
+      }
+
+      const confirmText = {
+        accepted: "Отмечено как «в процессе»",
+        trade_sent: "Отмечено как «трейд отправлен»",
+        received: "Вывод завершён ✅"
+      }[newStage];
+      await answerCallback(callback.id, confirmText);
+
       return res.sendStatus(200);
     }
 
-    const updated = await advanceWithdrawalStatus(withdrawalId, newStage);
-    if (!updated) {
-      await answerCallback(callback.id, "Заявка не найдена");
+    // 2. Подтверждение перед оплатой Telegram Stars — Telegram ждёт ответ в течение 10 секунд
+    if (req.body.pre_checkout_query) {
+      await answerPreCheckoutQuery(req.body.pre_checkout_query.id, true);
       return res.sendStatus(200);
     }
 
-    const confirmText = {
-      accepted: "Отмечено как «в процессе»",
-      trade_sent: "Отмечено как «трейд отправлен»",
-      received: "Вывод завершён ✅"
-    }[newStage];
-    await answerCallback(callback.id, confirmText);
+    // 3. Успешная оплата Telegram Stars — зачисляем баланс по order_id, сохранённому в payload счёта
+    const successfulPayment = req.body.message && req.body.message.successful_payment;
+    if (successfulPayment) {
+      await creditPaymentByOrderId(successfulPayment.invoice_payload);
+      return res.sendStatus(200);
+    }
 
-    res.sendStatus(200);
+    res.sendStatus(200); // не связанное с нами обновление — просто подтверждаем получение
   } catch (err) {
     console.error("Ошибка обработки webhook:", err);
     res.sendStatus(200); // Telegram всё равно ждёт 200, иначе будет повторять попытки
@@ -821,24 +902,147 @@ app.post("/nowpayments-webhook", async (req, res) => {
     }
 
     const { order_id, payment_status } = req.body;
-
     if (payment_status === "finished") {
-      const paymentResult = await pool.query("SELECT * FROM payments WHERE order_id = $1", [order_id]);
-      if (paymentResult.rows.length > 0 && paymentResult.rows[0].status !== "finished") {
-        const payment = paymentResult.rows[0];
-        await pool.query(
-          "UPDATE users SET balance = balance + $1 WHERE telegram_id = $2",
-          [payment.amount_uah, payment.telegram_id]
-        );
-        await pool.query("UPDATE payments SET status = 'finished' WHERE id = $1", [payment.id]);
-        console.log(`Зачислено ${payment.amount_uah} ₴ пользователю ${payment.telegram_id} (заказ ${order_id})`);
-      }
+      await creditPaymentByOrderId(order_id);
     }
 
     res.sendStatus(200);
   } catch (err) {
     console.error("Ошибка обработки webhook NOWPayments:", err);
     res.sendStatus(200); // NOWPayments ждёт 200, иначе будет повторять попытки
+  }
+});
+
+// ===== Оплата банковской картой (LiqPay) =====
+
+// Минимальная сумма пополнения картой — используется фронтом для подсказки
+app.get("/api/payment/card-info", (req, res) => {
+  res.json({ min_uah: LIQPAY_MIN_UAH });
+});
+
+app.post("/api/payment/card/create", async (req, res) => {
+  try {
+    const { telegram_id, amount_uah } = req.body;
+    if (!amount_uah || amount_uah <= 0) {
+      return res.status(400).json({ error: "Некорректная сумма" });
+    }
+    if (amount_uah < LIQPAY_MIN_UAH) {
+      return res.status(400).json({ error: `Минимальная сумма пополнения картой: ${LIQPAY_MIN_UAH} ₴` });
+    }
+    if (!LIQPAY_PUBLIC_KEY || !LIQPAY_PRIVATE_KEY) {
+      return res.status(500).json({ error: "Оплата картой пока не настроена на сервере" });
+    }
+
+    const order_id = `topup_card_${telegram_id}_${Date.now()}`;
+    const amount_usd = +(amount_uah / UAH_PER_USD).toFixed(2);
+
+    const liqpayPayload = {
+      version: 3,
+      public_key: LIQPAY_PUBLIC_KEY,
+      action: "pay",
+      amount: amount_uah,
+      currency: "UAH",
+      description: "Пополнение баланса VeDrop",
+      order_id,
+      server_url: "https://cs-cases-backend.onrender.com/liqpay-webhook"
+    };
+    const data = Buffer.from(JSON.stringify(liqpayPayload)).toString("base64");
+    const signature = liqpaySignature(data);
+    const checkoutUrl = `https://www.liqpay.ua/api/3/checkout?data=${encodeURIComponent(data)}&signature=${encodeURIComponent(signature)}`;
+
+    await pool.query(
+      `INSERT INTO payments (telegram_id, order_id, amount_uah, amount_usd, method, status)
+       VALUES ($1, $2, $3, $4, 'card', 'waiting')`,
+      [telegram_id, order_id, amount_uah, amount_usd]
+    );
+
+    res.json({ invoice_url: checkoutUrl });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Webhook: сюда LiqPay присылает уведомления об изменении статуса платежа (form-encoded: data, signature)
+app.post("/liqpay-webhook", async (req, res) => {
+  try {
+    const { data, signature } = req.body;
+    if (!data || !signature) return res.sendStatus(400);
+
+    const expectedSignature = liqpaySignature(data);
+    if (signature !== expectedSignature) {
+      console.warn("Неверная подпись webhook LiqPay — запрос отклонён");
+      return res.sendStatus(403);
+    }
+
+    const payload = JSON.parse(Buffer.from(data, "base64").toString("utf-8"));
+    if (["success", "sandbox"].includes(payload.status)) {
+      await creditPaymentByOrderId(payload.order_id);
+    }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("Ошибка обработки webhook LiqPay:", err);
+    res.sendStatus(200); // LiqPay ждёт 200, иначе будет повторять попытки
+  }
+});
+
+// ===== Оплата Telegram Stars =====
+
+// Минимальная сумма и курс — используется фронтом для подсказки и предпросмотра количества звёзд
+app.get("/api/payment/stars-info", (req, res) => {
+  res.json({
+    min_uah: starsMinUah(),
+    uah_per_star: +(UAH_PER_USD * STAR_USD_RATE).toFixed(3)
+  });
+});
+
+app.post("/api/payment/stars/create", async (req, res) => {
+  try {
+    const { telegram_id, amount_uah } = req.body;
+    if (!amount_uah || amount_uah <= 0) {
+      return res.status(400).json({ error: "Некорректная сумма" });
+    }
+    const minUah = starsMinUah();
+    if (amount_uah < minUah) {
+      return res.status(400).json({ error: `Минимальная сумма пополнения через Stars: ${minUah} ₴` });
+    }
+    if (!process.env.BOT_TOKEN) {
+      return res.status(500).json({ error: "Оплата Stars пока не настроена на сервере" });
+    }
+
+    const stars = uahToStars(amount_uah);
+    const order_id = `topup_stars_${telegram_id}_${Date.now()}`;
+    const amount_usd = +(amount_uah / UAH_PER_USD).toFixed(2);
+
+    const tgRes = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/createInvoiceLink`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: "Пополнение баланса VeDrop",
+        description: `Пополнение баланса на ${amount_uah} ₴`,
+        payload: order_id,
+        provider_token: "", // для Telegram Stars provider_token всегда пустая строка
+        currency: "XTR",
+        prices: [{ label: "Пополнение баланса", amount: stars }]
+      })
+    });
+    const tgData = await tgRes.json();
+    if (!tgData.ok) {
+      console.error("Ошибка createInvoiceLink:", tgData);
+      return res.status(500).json({ error: "Не удалось создать счёт для оплаты Stars" });
+    }
+
+    await pool.query(
+      `INSERT INTO payments (telegram_id, order_id, amount_uah, amount_usd, amount_stars, method, status)
+       VALUES ($1, $2, $3, $4, $5, 'stars', 'waiting')`,
+      [telegram_id, order_id, amount_uah, amount_usd, stars]
+    );
+
+    res.json({ invoice_link: tgData.result, stars });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
   }
 });
 
