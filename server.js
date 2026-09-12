@@ -131,6 +131,23 @@ async function initDatabase() {
     );
   `);
 
+  // История апгрейдов — лог каждой попытки (для статистики и на будущее для админки)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS upgrades (
+      id SERIAL PRIMARY KEY,
+      telegram_id BIGINT NOT NULL REFERENCES users(telegram_id),
+      item_name TEXT NOT NULL,
+      item_image TEXT NOT NULL,
+      rarity TEXT NOT NULL,
+      stake_value INTEGER NOT NULL,
+      multiplier NUMERIC NOT NULL,
+      chance_percent NUMERIC NOT NULL,
+      won BOOLEAN NOT NULL,
+      result_value INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
   // Если таблица кейсов ещё пустая — заполняем её текущими тремя кейсами (первый запуск после обновления)
   const caseCount = await pool.query("SELECT COUNT(*) FROM case_defs");
   if (parseInt(caseCount.rows[0].count, 10) === 0) {
@@ -150,7 +167,7 @@ async function initDatabase() {
     }
   }
 
-  console.log("База данных готова: таблицы users, inventory, openings, withdrawals, payments, case_defs, case_items, support_messages, support_conversations проверены/созданы");
+  console.log("База данных готова: таблицы users, inventory, openings, withdrawals, payments, case_defs, case_items, support_messages, support_conversations, upgrades проверены/созданы");
 }
 
 // Отправка сообщения владельцу проекта в Telegram через Bot API
@@ -444,6 +461,11 @@ const SEED_CASES = [
     ]
   }
 ];
+
+// ===== Апгрейд предметов (на множитель) =====
+// house edge 0.92 означает встроенное преимущество площадки ~8% — шанс всегда чуть ниже "честного" 100/множитель
+const UPGRADE_HOUSE_EDGE = 0.92;
+const UPGRADE_MULTIPLIERS = [1.5, 2, 3, 5, 10, 20];
 
 // Честный взвешенный случайный выбор — считается только здесь, на сервере
 function pickWinner(items) {
@@ -740,6 +762,69 @@ app.get("/api/support/messages/:telegram_id", async (req, res) => {
       [req.params.telegram_id]
     );
     res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// ===== Апгрейд предметов =====
+
+// Список доступных множителей и house edge — фронт использует, чтобы показать шанс для каждого множителя
+app.get("/api/upgrade/info", (req, res) => {
+  res.json({ house_edge: UPGRADE_HOUSE_EDGE, multipliers: UPGRADE_MULTIPLIERS });
+});
+
+// Попытка апгрейда: предмет уходит в любом случае, при удаче баланс пополняется на value*multiplier
+app.post("/api/upgrade", async (req, res) => {
+  try {
+    const { telegram_id, item_id, multiplier } = req.body;
+    if (!telegram_id || !item_id || !multiplier) {
+      return res.status(400).json({ error: "Некорректный запрос" });
+    }
+    if (!UPGRADE_MULTIPLIERS.includes(multiplier)) {
+      return res.status(400).json({ error: "Недопустимый множитель" });
+    }
+
+    const itemResult = await pool.query(
+      "SELECT * FROM inventory WHERE id = $1 AND telegram_id = $2",
+      [item_id, telegram_id]
+    );
+    if (itemResult.rows.length === 0) {
+      return res.status(404).json({ error: "Предмет не найден" });
+    }
+    const item = itemResult.rows[0];
+    if (item.withdraw_status) {
+      return res.status(400).json({ error: "На этот предмет уже подана заявка на вывод" });
+    }
+
+    const chance = Math.min(100, (100 / multiplier) * UPGRADE_HOUSE_EDGE);
+    const roll = Math.random() * 100;
+    const won = roll < chance;
+    const resultValue = won ? Math.round(item.value * multiplier) : 0;
+
+    // Предмет списывается независимо от исхода — либо превращается в баланс, либо теряется
+    await pool.query("DELETE FROM inventory WHERE id = $1", [item_id]);
+
+    let newBalance;
+    if (won) {
+      const updated = await pool.query(
+        "UPDATE users SET balance = balance + $1 WHERE telegram_id = $2 RETURNING balance",
+        [resultValue, telegram_id]
+      );
+      newBalance = updated.rows[0].balance;
+    } else {
+      const userResult = await pool.query("SELECT balance FROM users WHERE telegram_id = $1", [telegram_id]);
+      newBalance = userResult.rows[0].balance;
+    }
+
+    await pool.query(
+      `INSERT INTO upgrades (telegram_id, item_name, item_image, rarity, stake_value, multiplier, chance_percent, won, result_value)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [telegram_id, item.item_name, item.item_image, item.rarity, item.value, multiplier, chance.toFixed(2), won, resultValue]
+    );
+
+    res.json({ won, chance: +chance.toFixed(2), resultValue, newBalance });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Ошибка сервера" });
