@@ -109,6 +109,27 @@ async function initDatabase() {
     );
   `);
 
+  // Общий каталог предметов — создаётся один раз в админке, дальше используется и в кейсах, и в апгрейдере
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS catalog_items (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      image TEXT NOT NULL,
+      rarity TEXT NOT NULL,
+      price INTEGER NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // Привязка предмета кейса к каталогу (жёсткая связь — правка цены/картинки в каталоге сразу видна везде).
+  // Старые колонки name/image/rarity/value делаем необязательными и оставляем как запасной вариант —
+  // так уже существующие кейсы (созданные до этого обновления) продолжают работать без миграции.
+  await pool.query(`ALTER TABLE case_items ADD COLUMN IF NOT EXISTS catalog_item_id INTEGER REFERENCES catalog_items(id);`);
+  await pool.query(`ALTER TABLE case_items ALTER COLUMN name DROP NOT NULL;`);
+  await pool.query(`ALTER TABLE case_items ALTER COLUMN image DROP NOT NULL;`);
+  await pool.query(`ALTER TABLE case_items ALTER COLUMN rarity DROP NOT NULL;`);
+  await pool.query(`ALTER TABLE case_items ALTER COLUMN value DROP NOT NULL;`);
+
   // Чат поддержки: каждое сообщение — либо от игрока, либо от админа, привязано к telegram_id игрока
   await pool.query(`
     CREATE TABLE IF NOT EXISTS support_messages (
@@ -131,27 +152,63 @@ async function initDatabase() {
     );
   `);
 
-  // История апгрейдов — лог каждой попытки (для статистики и на будущее для админки)
+  // История апгрейдов — лог каждой попытки (для статистики и на будущее для админки).
+  // Механизм апгрейда поменялся с "на множитель" на "на конкретный предмет" — добавляем новые колонки
+  // и снимаем NOT NULL со старых (на случай, если таблица уже существовала с прошлой версией).
   await pool.query(`
     CREATE TABLE IF NOT EXISTS upgrades (
       id SERIAL PRIMARY KEY,
       telegram_id BIGINT NOT NULL REFERENCES users(telegram_id),
-      item_name TEXT NOT NULL,
-      item_image TEXT NOT NULL,
-      rarity TEXT NOT NULL,
       stake_value INTEGER NOT NULL,
-      multiplier NUMERIC NOT NULL,
       chance_percent NUMERIC NOT NULL,
       won BOOLEAN NOT NULL,
-      result_value INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
   `);
+  await pool.query(`ALTER TABLE upgrades ADD COLUMN IF NOT EXISTS target_catalog_item_id INTEGER REFERENCES catalog_items(id);`);
+  await pool.query(`ALTER TABLE upgrades ADD COLUMN IF NOT EXISTS target_name TEXT;`);
+  await pool.query(`ALTER TABLE upgrades ADD COLUMN IF NOT EXISTS target_value INTEGER;`);
+  await pool.query(`ALTER TABLE upgrades ADD COLUMN IF NOT EXISTS item_count INTEGER;`);
+  // На свежей базе этих колонок вообще нет — снимаем NOT NULL только если колонка существует (старая база)
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'upgrades' AND column_name = 'item_name') THEN
+        ALTER TABLE upgrades ALTER COLUMN item_name DROP NOT NULL;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'upgrades' AND column_name = 'item_image') THEN
+        ALTER TABLE upgrades ALTER COLUMN item_image DROP NOT NULL;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'upgrades' AND column_name = 'rarity') THEN
+        ALTER TABLE upgrades ALTER COLUMN rarity DROP NOT NULL;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'upgrades' AND column_name = 'multiplier') THEN
+        ALTER TABLE upgrades ALTER COLUMN multiplier DROP NOT NULL;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'upgrades' AND column_name = 'result_value') THEN
+        ALTER TABLE upgrades ALTER COLUMN result_value DROP NOT NULL;
+      END IF;
+    END $$;
+  `);
 
-  // Если таблица кейсов ещё пустая — заполняем её текущими тремя кейсами (первый запуск после обновления)
+  // Если таблица кейсов ещё пустая — заполняем её текущими тремя кейсами (первый запуск после обновления).
+  // Сначала заполняем общий каталог предметов (без дублей по названию), потом создаём кейсы со ссылками на него.
   const caseCount = await pool.query("SELECT COUNT(*) FROM case_defs");
   if (parseInt(caseCount.rows[0].count, 10) === 0) {
     console.log("Таблица кейсов пуста — заполняем стартовыми кейсами...");
+
+    const catalogIdByName = new Map();
+    for (const c of SEED_CASES) {
+      for (const item of c.items) {
+        if (catalogIdByName.has(item.name)) continue;
+        const inserted = await pool.query(
+          "INSERT INTO catalog_items (name, image, rarity, price) VALUES ($1, $2, $3, $4) RETURNING id",
+          [item.name, item.image, item.rarity, item.value]
+        );
+        catalogIdByName.set(item.name, inserted.rows[0].id);
+      }
+    }
+
     for (let i = 0; i < SEED_CASES.length; i++) {
       const c = SEED_CASES[i];
       await pool.query(
@@ -160,8 +217,8 @@ async function initDatabase() {
       );
       for (const item of c.items) {
         await pool.query(
-          "INSERT INTO case_items (case_id, name, image, rarity, weight, value) VALUES ($1, $2, $3, $4, $5, $6)",
-          [c.id, item.name, item.image, item.rarity, item.weight, item.value]
+          "INSERT INTO case_items (case_id, catalog_item_id, weight) VALUES ($1, $2, $3)",
+          [c.id, catalogIdByName.get(item.name), item.weight]
         );
       }
     }
@@ -462,10 +519,9 @@ const SEED_CASES = [
   }
 ];
 
-// ===== Апгрейд предметов (на множитель) =====
-// house edge 0.92 означает встроенное преимущество площадки ~8% — шанс всегда чуть ниже "честного" 100/множитель
+// ===== Апгрейд предметов (на конкретный предмет из каталога) =====
+// house edge 0.92 означает встроенное преимущество площадки ~8% — шанс всегда чуть ниже "честного" стоимость/стоимость
 const UPGRADE_HOUSE_EDGE = 0.92;
-const UPGRADE_MULTIPLIERS = [1.5, 2, 3, 5, 10, 20];
 
 // Честный взвешенный случайный выбор — считается только здесь, на сервере
 function pickWinner(items) {
@@ -516,7 +572,16 @@ app.post("/api/open-case", async (req, res) => {
     if (caseResult.rows.length === 0) return res.status(400).json({ error: "Такого кейса не существует" });
     const caseData = caseResult.rows[0];
 
-    const itemsResult = await pool.query("SELECT * FROM case_items WHERE case_id = $1", [case_id]);
+    const itemsResult = await pool.query(`
+      SELECT ci.id, ci.weight,
+        COALESCE(cat.name, ci.name) AS name,
+        COALESCE(cat.image, ci.image) AS image,
+        COALESCE(cat.rarity, ci.rarity) AS rarity,
+        COALESCE(cat.price, ci.value) AS value
+      FROM case_items ci
+      LEFT JOIN catalog_items cat ON cat.id = ci.catalog_item_id
+      WHERE ci.case_id = $1
+    `, [case_id]);
     if (itemsResult.rows.length === 0) return res.status(400).json({ error: "В этом кейсе нет предметов" });
 
     const userResult = await pool.query("SELECT * FROM users WHERE telegram_id = $1", [telegram_id]);
@@ -551,7 +616,16 @@ app.get("/api/cases", async (req, res) => {
     const casesResult = await pool.query("SELECT * FROM case_defs ORDER BY sort_order ASC, name ASC");
     const cases = [];
     for (const c of casesResult.rows) {
-      const itemsResult = await pool.query("SELECT * FROM case_items WHERE case_id = $1", [c.id]);
+      const itemsResult = await pool.query(`
+        SELECT ci.id, ci.weight,
+          COALESCE(cat.name, ci.name) AS name,
+          COALESCE(cat.image, ci.image) AS image,
+          COALESCE(cat.rarity, ci.rarity) AS rarity,
+          COALESCE(cat.price, ci.value) AS value
+        FROM case_items ci
+        LEFT JOIN catalog_items cat ON cat.id = ci.catalog_item_id
+        WHERE ci.case_id = $1
+      `, [c.id]);
       cases.push({
         id: c.id,
         name: c.name,
@@ -768,63 +842,74 @@ app.get("/api/support/messages/:telegram_id", async (req, res) => {
   }
 });
 
-// ===== Апгрейд предметов =====
+// ===== Апгрейд предметов (на конкретный предмет из каталога) =====
 
-// Список доступных множителей и house edge — фронт использует, чтобы показать шанс для каждого множителя
-app.get("/api/upgrade/info", (req, res) => {
-  res.json({ house_edge: UPGRADE_HOUSE_EDGE, multipliers: UPGRADE_MULTIPLIERS });
+// Список предметов каталога, которые можно выбрать целью апгрейда
+app.get("/api/upgrade/targets", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id, name, image, rarity, price FROM catalog_items ORDER BY price ASC");
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
 });
 
-// Попытка апгрейда: предмет уходит в любом случае, при удаче баланс пополняется на value*multiplier
+// Попытка апгрейда: один или несколько своих предметов ставятся на кон ради выбранного предмета из каталога.
+// Шанс = (сумма стоимости своих предметов / цена цели) × 100 × house edge. Предметы списываются в любом случае;
+// при удаче в инвентарь добавляется целевой предмет.
 app.post("/api/upgrade", async (req, res) => {
   try {
-    const { telegram_id, item_id, multiplier } = req.body;
-    if (!telegram_id || !item_id || !multiplier) {
+    const { telegram_id, item_ids, target_catalog_item_id } = req.body;
+    if (!telegram_id || !Array.isArray(item_ids) || item_ids.length === 0 || !target_catalog_item_id) {
       return res.status(400).json({ error: "Некорректный запрос" });
     }
-    if (!UPGRADE_MULTIPLIERS.includes(multiplier)) {
-      return res.status(400).json({ error: "Недопустимый множитель" });
-    }
 
-    const itemResult = await pool.query(
-      "SELECT * FROM inventory WHERE id = $1 AND telegram_id = $2",
-      [item_id, telegram_id]
+    const itemsResult = await pool.query(
+      "SELECT * FROM inventory WHERE id = ANY($1) AND telegram_id = $2",
+      [item_ids, telegram_id]
     );
-    if (itemResult.rows.length === 0) {
-      return res.status(404).json({ error: "Предмет не найден" });
+    if (itemsResult.rows.length !== item_ids.length) {
+      return res.status(400).json({ error: "Некоторые предметы не найдены" });
     }
-    const item = itemResult.rows[0];
-    if (item.withdraw_status) {
-      return res.status(400).json({ error: "На этот предмет уже подана заявка на вывод" });
+    if (itemsResult.rows.some(i => i.withdraw_status)) {
+      return res.status(400).json({ error: "На один из предметов уже подана заявка на вывод" });
     }
 
-    const chance = Math.min(100, (100 / multiplier) * UPGRADE_HOUSE_EDGE);
+    const targetResult = await pool.query("SELECT * FROM catalog_items WHERE id = $1", [target_catalog_item_id]);
+    if (targetResult.rows.length === 0) {
+      return res.status(404).json({ error: "Целевой предмет не найден" });
+    }
+    const target = targetResult.rows[0];
+
+    const stakeValue = itemsResult.rows.reduce((sum, i) => sum + i.value, 0);
+    const chance = Math.min(100, (stakeValue / target.price) * 100 * UPGRADE_HOUSE_EDGE);
     const roll = Math.random() * 100;
     const won = roll < chance;
-    const resultValue = won ? Math.round(item.value * multiplier) : 0;
 
-    // Предмет списывается независимо от исхода — либо превращается в баланс, либо теряется
-    await pool.query("DELETE FROM inventory WHERE id = $1", [item_id]);
+    // Ставка списывается независимо от исхода
+    await pool.query("DELETE FROM inventory WHERE id = ANY($1) AND telegram_id = $2", [item_ids, telegram_id]);
 
-    let newBalance;
     if (won) {
-      const updated = await pool.query(
-        "UPDATE users SET balance = balance + $1 WHERE telegram_id = $2 RETURNING balance",
-        [resultValue, telegram_id]
+      await pool.query(
+        `INSERT INTO inventory (telegram_id, item_name, item_image, rarity, value)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [telegram_id, target.name, target.image, target.rarity, target.price]
       );
-      newBalance = updated.rows[0].balance;
-    } else {
-      const userResult = await pool.query("SELECT balance FROM users WHERE telegram_id = $1", [telegram_id]);
-      newBalance = userResult.rows[0].balance;
     }
 
     await pool.query(
-      `INSERT INTO upgrades (telegram_id, item_name, item_image, rarity, stake_value, multiplier, chance_percent, won, result_value)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [telegram_id, item.item_name, item.item_image, item.rarity, item.value, multiplier, chance.toFixed(2), won, resultValue]
+      `INSERT INTO upgrades (telegram_id, stake_value, target_catalog_item_id, target_name, target_value, chance_percent, won, item_count)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [telegram_id, stakeValue, target_catalog_item_id, target.name, target.price, chance.toFixed(2), won, item_ids.length]
     );
 
-    res.json({ won, chance: +chance.toFixed(2), resultValue, newBalance });
+    res.json({
+      won,
+      chance: +chance.toFixed(2),
+      roll: +roll.toFixed(2),
+      target: { name: target.name, image: target.image, rarity: target.rarity, value: target.price }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Ошибка сервера" });
@@ -1221,13 +1306,98 @@ app.get("/api/admin/users/:telegram_id/inventory", requireAdmin, async (req, res
   }
 });
 
+// --- Каталог предметов (общий для кейсов и апгрейдера) ---
+app.get("/api/admin/catalog", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT c.*, COALESCE(u.usage_count, 0) AS usage_count
+      FROM catalog_items c
+      LEFT JOIN (
+        SELECT catalog_item_id, COUNT(*) AS usage_count
+        FROM case_items
+        WHERE catalog_item_id IS NOT NULL
+        GROUP BY catalog_item_id
+      ) u ON u.catalog_item_id = c.id
+      ORDER BY c.name ASC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+app.post("/api/admin/catalog", requireAdmin, async (req, res) => {
+  try {
+    const { name, image, rarity, price } = req.body;
+    if (!name || !image || !rarity || !price) {
+      return res.status(400).json({ error: "Заполни все поля" });
+    }
+    const result = await pool.query(
+      "INSERT INTO catalog_items (name, image, rarity, price) VALUES ($1, $2, $3, $4) RETURNING *",
+      [name, image, rarity, price]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+app.put("/api/admin/catalog/:id", requireAdmin, async (req, res) => {
+  try {
+    const { name, image, rarity, price } = req.body;
+    if (!name || !image || !rarity || !price) {
+      return res.status(400).json({ error: "Заполни все поля" });
+    }
+    const result = await pool.query(
+      "UPDATE catalog_items SET name = $1, image = $2, rarity = $3, price = $4 WHERE id = $5 RETURNING *",
+      [name, image, rarity, price, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Предмет не найден" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Удалить можно только предмет, который нигде не используется — иначе сломаются кейсы, где он есть
+app.delete("/api/admin/catalog/:id", requireAdmin, async (req, res) => {
+  try {
+    const usageResult = await pool.query(
+      "SELECT COUNT(*) FROM case_items WHERE catalog_item_id = $1",
+      [req.params.id]
+    );
+    const usageCount = parseInt(usageResult.rows[0].count, 10);
+    if (usageCount > 0) {
+      return res.status(400).json({ error: `Предмет используется в ${usageCount} кейс(ах) — сначала убери его оттуда` });
+    }
+    await pool.query("DELETE FROM catalog_items WHERE id = $1", [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
 // --- Управление кейсами ---
 app.get("/api/admin/cases", requireAdmin, async (req, res) => {
   try {
     const casesResult = await pool.query("SELECT * FROM case_defs ORDER BY sort_order ASC, name ASC");
     const cases = [];
     for (const c of casesResult.rows) {
-      const itemsResult = await pool.query("SELECT * FROM case_items WHERE case_id = $1 ORDER BY value DESC", [c.id]);
+      const itemsResult = await pool.query(`
+        SELECT ci.id, ci.catalog_item_id, ci.weight,
+          COALESCE(cat.name, ci.name) AS item_name,
+          COALESCE(cat.image, ci.image) AS item_image,
+          COALESCE(cat.rarity, ci.rarity) AS item_rarity,
+          COALESCE(cat.price, ci.value) AS item_value
+        FROM case_items ci
+        LEFT JOIN catalog_items cat ON cat.id = ci.catalog_item_id
+        WHERE ci.case_id = $1
+        ORDER BY item_value DESC
+      `, [c.id]);
       cases.push({ ...c, items: itemsResult.rows });
     }
     res.json(cases);
@@ -1242,6 +1412,9 @@ app.post("/api/admin/cases", requireAdmin, async (req, res) => {
     const { id, name, price, image, items } = req.body;
     if (!id || !name || !price || !image || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Заполни все поля кейса и добавь хотя бы один предмет" });
+    }
+    if (items.some(i => !i.catalog_item_id || !i.weight)) {
+      return res.status(400).json({ error: "У каждого предмета должен быть выбран предмет из каталога и указан вес" });
     }
 
     const existing = await pool.query("SELECT id FROM case_defs WHERE id = $1", [id]);
@@ -1258,8 +1431,8 @@ app.post("/api/admin/cases", requireAdmin, async (req, res) => {
     );
     for (const item of items) {
       await pool.query(
-        "INSERT INTO case_items (case_id, name, image, rarity, weight, value) VALUES ($1, $2, $3, $4, $5, $6)",
-        [id, item.name, item.image, item.rarity, item.weight, item.value]
+        "INSERT INTO case_items (case_id, catalog_item_id, weight) VALUES ($1, $2, $3)",
+        [id, item.catalog_item_id, item.weight]
       );
     }
 
@@ -1276,6 +1449,9 @@ app.put("/api/admin/cases/:id", requireAdmin, async (req, res) => {
     if (!name || !price || !image || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Заполни все поля кейса и добавь хотя бы один предмет" });
     }
+    if (items.some(i => !i.catalog_item_id || !i.weight)) {
+      return res.status(400).json({ error: "У каждого предмета должен быть выбран предмет из каталога и указан вес" });
+    }
 
     const existing = await pool.query("SELECT id FROM case_defs WHERE id = $1", [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Кейс не найден" });
@@ -1289,8 +1465,8 @@ app.put("/api/admin/cases/:id", requireAdmin, async (req, res) => {
     await pool.query("DELETE FROM case_items WHERE case_id = $1", [req.params.id]);
     for (const item of items) {
       await pool.query(
-        "INSERT INTO case_items (case_id, name, image, rarity, weight, value) VALUES ($1, $2, $3, $4, $5, $6)",
-        [req.params.id, item.name, item.image, item.rarity, item.weight, item.value]
+        "INSERT INTO case_items (case_id, catalog_item_id, weight) VALUES ($1, $2, $3)",
+        [req.params.id, item.catalog_item_id, item.weight]
       );
     }
 
